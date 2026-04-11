@@ -100,19 +100,25 @@ class ChessGUI:
     def _render_pieces(self) -> None:
         """Pre-render all chess piece symbols to surfaces."""
         for code, symbol in PIECE_SYMBOLS.items():
-            color = (255, 255, 255) if code[0] == "w" else (30, 30, 30)
-            # Use white fill for white pieces, dark for black
             if code[0] == "w":
-                bg_color = (255, 255, 255)
-                text_color = (0, 0, 0)
+                fill_color = (255, 255, 255)
+                outline_color = (0, 0, 0)
             else:
-                bg_color = (50, 50, 50)
-                text_color = (255, 255, 255)
+                fill_color = (30, 30, 30)
+                outline_color = (200, 200, 200)
 
             surface = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
-            text_surf = self.piece_font.render(symbol, True, text_color)
+            text_surf = self.piece_font.render(symbol, True, fill_color)
+            outline_surf = self.piece_font.render(symbol, True, outline_color)
             # Center the piece on the square
             text_rect = text_surf.get_rect(center=(SQUARE_SIZE // 2, SQUARE_SIZE // 2))
+            # Draw outline at 8 offsets for a clean border
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    surface.blit(outline_surf, (text_rect.x + dx, text_rect.y + dy))
+            # Draw fill on top
             surface.blit(text_surf, text_rect)
             self.piece_surfaces[code] = surface
 
@@ -509,11 +515,10 @@ class ChessGUI:
         if mode == "engine_vs_engine":
             self.mode = "engine_vs_engine"
             self.player_color = "w"  # Doesn't matter
-            self.flipped = False
         else:
             self.mode = "play"
             self.player_color = mode
-            self.flipped = (mode == "b")
+        self.flipped = False
         self.reset_game()
 
     def run(self) -> None:
