@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: glm_cc_chess
+Version: 0.1.0
+Summary: A Windows desktop chess application with GUI and built-in engine
+Requires-Python: >=3.12
+Requires-Dist: pygame>=2.5.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=5.0.0; extra == "dev"

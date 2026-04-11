@@ -6,12 +6,24 @@ legal move highlighting, and game status display.
 
 from __future__ import annotations
 
+import os
 import sys
 import pygame
 from src.board import Board, STARTING_FEN
 from src.game import GameState
 from src.moves import generate_legal_moves, move_to_algebraic, Move
 from src.engine import ChessEngine
+
+
+def _resource_path(relative_path: str) -> str:
+    """Return the absolute path to a bundled resource, works in dev and PyInstaller."""
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        base = sys._MEIPASS
+    else:
+        # Running from source
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, relative_path)
 
 # Constants
 SQUARE_SIZE = 80
@@ -54,11 +66,12 @@ class ChessGUI:
         pygame.display.set_caption("GLM CC Chess")
         self.clock = pygame.time.Clock()
 
-        # Fonts
-        self.piece_font = pygame.font.SysFont("segoeuisymbol", 58)
-        self.small_font = pygame.font.SysFont("arial", 16)
-        self.medium_font = pygame.font.SysFont("arial", 18, bold=True)
-        self.large_font = pygame.font.SysFont("arial", 28, bold=True)
+        # Fonts — use bundled TTF to avoid SysFont crash on some Windows PCs
+        symbol_font_path = _resource_path(os.path.join("fonts", "NotoSansSymbols2.ttf"))
+        self.piece_font = pygame.font.Font(symbol_font_path, 58)
+        self.small_font = pygame.font.Font(None, 22)
+        self.medium_font = pygame.font.Font(None, 24)
+        self.large_font = pygame.font.Font(None, 36)
 
         # Game state
         self.game = GameState()

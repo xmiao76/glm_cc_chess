@@ -15,11 +15,12 @@ The zip contains:
 
 import argparse
 import re
+import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 RELEASE_DIR = Path(__file__).parent / "release"
+SPEC_FILE = Path(__file__).parent / "GLM_CC_Chess.spec"
 EXE_NAME = "GLM_CC_Chess.exe"
 README_NAME = "readme.txt"
 
@@ -36,6 +37,23 @@ def read_version_from_readme(readme_path: Path) -> str:
     )
 
 
+def build_exe() -> Path:
+    """Run PyInstaller to build the exe."""
+    cmd = [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm", str(SPEC_FILE)]
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, check=True)
+
+    exe_path = Path("dist") / EXE_NAME
+    if not exe_path.exists():
+        raise FileNotFoundError(f"PyInstaller did not produce {exe_path}")
+
+    # Copy exe to release dir
+    dest = RELEASE_DIR / EXE_NAME
+    dest.write_bytes(exe_path.read_bytes())
+    print(f"Copied {exe_path} -> {dest}")
+    return dest
+
+
 def build_zip(version: str) -> Path:
     exe_path = RELEASE_DIR / EXE_NAME
     readme_path = RELEASE_DIR / README_NAME
@@ -45,6 +63,8 @@ def build_zip(version: str) -> Path:
         raise FileNotFoundError(
             "Missing required files: " + ", ".join(str(p) for p in missing)
         )
+
+    import zipfile
 
     zip_name = f"GLM_CC_Chess_v{version}.zip"
     zip_path = RELEASE_DIR / zip_name
@@ -62,6 +82,11 @@ def main() -> None:
         "--version",
         help="Version string (e.g. 1.0.0). Defaults to the value in release/readme.txt.",
     )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Skip the PyInstaller build step (use existing exe in release/).",
+    )
     args = parser.parse_args()
 
     readme_path = RELEASE_DIR / README_NAME
@@ -71,6 +96,9 @@ def main() -> None:
 
     version = args.version or read_version_from_readme(readme_path)
     print(f"Packaging version {version} ...")
+
+    if not args.skip_build:
+        build_exe()
 
     try:
         zip_path = build_zip(version)

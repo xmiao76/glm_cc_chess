@@ -1,0 +1,17 @@
+pyproject.toml
+glm_cc_chess.egg-info/PKG-INFO
+glm_cc_chess.egg-info/SOURCES.txt
+glm_cc_chess.egg-info/dependency_links.txt
+glm_cc_chess.egg-info/requires.txt
+glm_cc_chess.egg-info/top_level.txt
+src/__init__.py
+src/board.py
+src/engine.py
+src/game.py
+src/gui.py
+src/main.py
+src/moves.py
+tests/test_board.py
+tests/test_engine.py
+tests/test_game.py
+tests/test_moves.py
