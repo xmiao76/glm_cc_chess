@@ -4,3 +4,4 @@
 release/*.exe
 .claude/settings.local.json
 /build
+/dist

@@ -77,6 +77,7 @@ class ChessGUI:
         self.game = GameState()
         self.engine = ChessEngine(max_depth=4, time_limit=1.5)
         self.player_color = "w"  # Human plays white by default
+        self.flipped = False  # Whether board is displayed from black's perspective
         self.selected_square: tuple[int, int] | None = None
         self.legal_moves_for_selected: list[Move] = []
         self.last_move: Move | None = None
@@ -136,8 +137,12 @@ class ChessGUI:
         x, y = pos
         if x >= BOARD_SIZE:
             return (-1, -1)  # Click on panel
-        col = x // SQUARE_SIZE
-        row = y // SQUARE_SIZE
+        if self.flipped:
+            col = 7 - x // SQUARE_SIZE
+            row = 7 - y // SQUARE_SIZE
+        else:
+            col = x // SQUARE_SIZE
+            row = y // SQUARE_SIZE
         return (row, col)
 
     def handle_click(self, pos: tuple[int, int]) -> None:
@@ -234,13 +239,19 @@ class ChessGUI:
         if move is not None:
             self.execute_move(move)
 
+    def _board_to_screen(self, row: int, col: int) -> tuple[int, int]:
+        """Convert board (row, col) to screen (x, y) position."""
+        if self.flipped:
+            return ((7 - col) * SQUARE_SIZE, (7 - row) * SQUARE_SIZE)
+        else:
+            return (col * SQUARE_SIZE, row * SQUARE_SIZE)
+
     def draw_board(self) -> None:
         """Draw the chess board and pieces."""
         # Draw squares
         for row in range(8):
             for col in range(8):
-                x = col * SQUARE_SIZE
-                y = row * SQUARE_SIZE
+                x, y = self._board_to_screen(row, col)
                 color = LIGHT_SQUARE if (row + col) % 2 == 0 else DARK_SQUARE
                 pygame.draw.rect(self.screen, color, (x, y, SQUARE_SIZE, SQUARE_SIZE))
 
@@ -249,22 +260,22 @@ class ChessGUI:
             from_r, from_c, to_r, to_c, _ = self.last_move
             surf = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
             surf.fill(LAST_MOVE_COLOR)
-            self.screen.blit(surf, (from_c * SQUARE_SIZE, from_r * SQUARE_SIZE))
-            self.screen.blit(surf, (to_c * SQUARE_SIZE, to_r * SQUARE_SIZE))
+            self.screen.blit(surf, self._board_to_screen(from_r, from_c))
+            self.screen.blit(surf, self._board_to_screen(to_r, to_c))
 
         # Highlight selected square
         if self.selected_square is not None:
             row, col = self.selected_square
             surf = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
             surf.fill(SELECTED_COLOR)
-            self.screen.blit(surf, (col * SQUARE_SIZE, row * SQUARE_SIZE))
+            self.screen.blit(surf, self._board_to_screen(row, col))
 
         # Highlight legal move destinations
         for move in self.legal_moves_for_selected:
             to_r, to_c = move[2], move[3]
             surf = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
             surf.fill(LEGAL_MOVE_COLOR)
-            self.screen.blit(surf, (to_c * SQUARE_SIZE, to_r * SQUARE_SIZE))
+            self.screen.blit(surf, self._board_to_screen(to_r, to_c))
 
         # Highlight king in check
         from src.moves import is_in_check
@@ -275,17 +286,23 @@ class ChessGUI:
                 kr, kc = king_pos
                 surf = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
                 surf.fill(CHECK_COLOR)
-                self.screen.blit(surf, (kc * SQUARE_SIZE, kr * SQUARE_SIZE))
+                self.screen.blit(surf, self._board_to_screen(kr, kc))
 
         # Draw rank and file labels
         for i in range(8):
             # File labels (a-h)
-            label = self.small_font.render(chr(ord("a") + i), True, (120, 120, 120))
+            if self.flipped:
+                file_char = chr(ord("a") + 7 - i)
+                rank_num = i + 1
+            else:
+                file_char = chr(ord("a") + i)
+                rank_num = 8 - i
+            label = self.small_font.render(file_char, True, (120, 120, 120))
             x = i * SQUARE_SIZE + SQUARE_SIZE - 12
             y = BOARD_SIZE - 16
             self.screen.blit(label, (x, y))
             # Rank labels (1-8)
-            label = self.small_font.render(str(8 - i), True, (120, 120, 120))
+            label = self.small_font.render(str(rank_num), True, (120, 120, 120))
             self.screen.blit(label, (2, i * SQUARE_SIZE + 2))
 
         # Draw pieces
@@ -293,8 +310,7 @@ class ChessGUI:
             for col in range(8):
                 piece = self.game.board.get_piece(row, col)
                 if piece is not None and piece in self.piece_surfaces:
-                    x = col * SQUARE_SIZE
-                    y = row * SQUARE_SIZE
+                    x, y = self._board_to_screen(row, col)
                     self.screen.blit(self.piece_surfaces[piece], (x, y))
 
         # Draw promotion dialog
@@ -371,16 +387,14 @@ class ChessGUI:
         # Use the destination square for positioning
         dest_row = self.promotion_moves[0][2]
         dest_col = self.promotion_moves[0][3]
-        dialog_x = dest_col * SQUARE_SIZE
-        dialog_y = dest_row * SQUARE_SIZE
+        dest_x, dest_y = self._board_to_screen(dest_row, dest_col)
         # For white promoting, dialog goes up; for black, goes down
         if promo_color == "w":
-            dialog_y = max(0, dest_row - 3) * SQUARE_SIZE
+            dialog_y = dest_y - 3 * SQUARE_SIZE
         else:
-            dialog_y = min(7, dest_row) * SQUARE_SIZE
-        # Actually, place dialog at the promotion row column
-        dialog_x = dest_col * SQUARE_SIZE
-        start_y = 0
+            dialog_y = dest_y
+        dialog_y = max(0, min(dialog_y, WINDOW_HEIGHT - SQUARE_SIZE * 4))
+        dialog_x = dest_x
         piece_types = ["Q", "R", "B", "N"]
 
         # Draw semi-transparent overlay
@@ -392,8 +406,7 @@ class ChessGUI:
         box_w = SQUARE_SIZE
         box_h = SQUARE_SIZE * 4
         box_x = dialog_x
-        box_y = dest_row * SQUARE_SIZE - (3 * SQUARE_SIZE if promo_color == "w" else 0)
-        box_y = max(0, min(box_y, WINDOW_HEIGHT - box_h))
+        box_y = dialog_y
 
         pygame.draw.rect(self.screen, (50, 50, 50), (box_x, box_y, box_w, box_h))
         pygame.draw.rect(self.screen, (200, 200, 200), (box_x, box_y, box_w, box_h), 2)
@@ -451,7 +464,7 @@ class ChessGUI:
         self.mode = "play"
 
     def _flip_color_action(self) -> None:
-        self.player_color = "b" if self.player_color == "w" else "w"
+        self.flipped = not self.flipped
 
     def _undo_action(self) -> None:
         if len(self.game.move_history) >= 2 and not self.game_over:
@@ -496,9 +509,11 @@ class ChessGUI:
         if mode == "engine_vs_engine":
             self.mode = "engine_vs_engine"
             self.player_color = "w"  # Doesn't matter
+            self.flipped = False
         else:
             self.mode = "play"
             self.player_color = mode
+            self.flipped = (mode == "b")
         self.reset_game()
 
     def run(self) -> None:
