@@ -1,1 +1,4 @@
 /venv
+
+# Ignore compiled executables — distribute via zip instead
+release/*.exe
