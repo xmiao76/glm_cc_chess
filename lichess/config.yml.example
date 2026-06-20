@@ -1,0 +1,41 @@
+# lichess-bot configuration template for the GLM CC Chess engine.
+#
+# This is a TEMPLATE — copy it to `config.yml` and fill in your real token.
+# `config.yml` is gitignored and must NEVER be committed.
+#
+# The primary way to play on Lichess is the in-GUI "AI vs Lichess" mode
+# (run `python -m src.main` or the packaged exe). This lichess-bot config is
+# for the OPTIONAL headless bridge that runs the engine unattended via the
+# UCI entry point (`python -m src.uci`).
+#
+# Token: prefer the LICHESS_BOT_TOKEN environment variable. If you put the
+# token here instead, use a gitignored `config.yml` copy (never this file).
+
+token: "LICHESS_BOT_TOKEN"   # set the real token via env var or a gitignored config.yml copy
+url: "https://lichess.org/"
+
+engine:
+  dir: "."                   # repo root (where run_engine.bat lives)
+  name: "run_engine.bat"     # wrapper that launches `python -m src.uci`
+  protocol: "uci"            # the engine speaks UCI over stdin/stdout
+  ponder: false              # our engine does not ponder
+  uci_options:
+    Move Overhead: 100       # ms reserved for network/latency overhead
+    Threads: 1               # the engine is single-threaded
+    Hash: 64                 # MB (the engine does not use a transposition table)
+
+abort_time: 30               # abort games that never start
+move_overhead: 2000          # ms safety margin so the bot does not flag
+
+challenge:
+  concurrency: 1             # one game at a time
+  variants:
+    - standard
+  time_controls:
+    - bullet
+    - blitz
+    - rapid
+    - classical
+  modes:
+    - casual
+    - rated

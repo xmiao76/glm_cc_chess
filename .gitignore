@@ -5,3 +5,10 @@ release/*.exe
 .claude/settings.local.json
 /build
 /dist
+
+# Lichess secrets — never commit real tokens or real config
+# (lichess/config.yml.example IS committed; the real config.yml is not)
+lichess/config.yml
+.lichess_token
+*.token
+lichess_bot.log

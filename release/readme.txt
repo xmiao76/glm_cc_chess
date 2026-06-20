@@ -2,7 +2,8 @@ GLM CC Chess - Readme
 ======================
 
 A Windows desktop chess game with a built-in AI engine.
-Play human vs engine or watch engine vs engine.
+Play human vs engine, watch engine vs engine, or let the engine
+play against opponents on Lichess.
 
 HOW TO START
 ------------
@@ -12,11 +13,31 @@ No installation required. No Python or other dependencies needed.
 
 GAME MODES
 ----------
-From the main menu, choose one of three modes:
+From the main menu, choose one of four modes:
 
-  1. Play as White   - You play White, the engine plays Black
-  2. Play as Black   - The engine plays White, you play Black
+  1. Play as White    - You play White, the engine plays Black
+  2. Play as Black    - The engine plays White, you play Black
   3. Engine vs Engine - Watch the engine play both sides
+  4. AI vs Lichess    - The engine plays real games on Lichess
+
+AI VS LICHESS
+-------------
+Lets the built-in engine play against opponents on Lichess using a
+dedicated Lichess BOT account. The game is shown live on the board and
+finished games can be reviewed move-by-step with the <<  <  >  >> buttons
+(or the Left/Right arrow keys).
+
+Requirements:
+  - A dedicated Lichess BOT account (NOT your personal account).
+  - A Lichess API token with the "bot:play" scope.
+  - The token set as the LICHESS_BOT_TOKEN environment variable before
+    launching the app, e.g. (Command Prompt):
+        set LICHESS_BOT_TOKEN=your_token_here
+  - An internet connection. On first run, Windows Firewall may prompt
+    for network access - allow it so the bot can reach lichess.org.
+
+If no token is found, the panel shows instructions. See the developer
+README and lichess/README_LICHESS.md (in the source repo) for full setup.
 
 HOW TO PLAY
 -----------
@@ -51,7 +72,7 @@ by default and typically responds within 1-2 seconds.
 SYSTEM REQUIREMENTS
 ------------------
   - Windows 10 or later
-  - No internet connection required
+  - No internet connection required (except for AI vs Lichess mode)
   - No additional software required
 
 TROUBLESHOOTING
@@ -71,4 +92,4 @@ Delete GLM_CC_Chess.exe. No other files are created on your system.
 
 VERSION
 -------
-1.0.0
+1.1.0

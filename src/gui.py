@@ -6,13 +6,21 @@ legal move highlighting, and game status display.
 
 from __future__ import annotations
 
+import logging
 import os
+import queue
 import sys
 import pygame
 from src.board import Board, STARTING_FEN
 from src.game import GameState
-from src.moves import generate_legal_moves, move_to_algebraic, Move
-from src.engine import ChessEngine
+from src.moves import generate_legal_moves, move_to_algebraic, uci_to_move, Move
+from src.engine import ChessEngine, choose_move
+from src.lichess_controller import (
+    LichessController, ChallengeReceived, GameStarted, GameUpdated,
+    EngineMoved, GameFinished, Status, Error,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _resource_path(relative_path: str) -> str:
@@ -89,9 +97,22 @@ class ChessGUI:
         self.captured_black: list[str] = []
         self.promotion_pending: Move | None = None  # Move awaiting promotion choice
         self.promotion_moves: list[Move] = []  # All promotion moves for the pending square
-        self.mode = "menu"  # "menu", "play", "engine_vs_engine"
+        self.mode = "menu"  # "menu", "play", "engine_vs_engine", "lichess"
         self.engine_vs_engine_delay = 500  # ms between moves
         self.last_engine_move_time = 0
+
+        # Lichess BOT integration state (only used in "lichess" mode)
+        self.lichess_controller: LichessController | None = None
+        self.lichess_game: dict | None = None  # current live/reviewed game
+        self.pending_challenge = None  # ChallengeReceived awaiting user decision
+        self.lichess_status = "Idle"
+        self.review_mode = False
+        self.review_index = 0
+        # Live UI feedback so the user can see what the bot is doing while idle
+        self.lichess_log: list[str] = []  # recent human-readable events
+        self.lichess_last_event_ticks = 0  # pygame ticks of last received event
+        self.lichess_last_move_text = ""  # e.g. "Move 12: e2e4"
+        self.lichess_connected = False
 
         # Pre-render piece surfaces
         self.piece_surfaces: dict[str, pygame.Surface] = {}
@@ -137,6 +158,311 @@ class ChessGUI:
         self.promotion_pending = None
         self.promotion_moves = []
         self.last_engine_move_time = pygame.time.get_ticks()
+
+    # --- Lichess BOT integration -----------------------------------------
+
+    def _get_lichess_token(self, config_path: str | None = None) -> str | None:
+        """Read the Lichess BOT token from the env var, then a gitignored config.
+
+        Order: ``LICHESS_BOT_TOKEN`` env var, then ``lichess/config.yml`` (or
+        ``config_path`` if given, for testability). The placeholder value
+        ``LICHESS_BOT_TOKEN`` (from the example file) is rejected so an unedited
+        copy is never used as a real token. The token is never stored on ``self``
+        or rendered to the UI.
+        """
+        token = os.environ.get("LICHESS_BOT_TOKEN")
+        if token and token.strip():
+            return token.strip()
+        if config_path is None:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            cfg_path = os.path.join(repo_root, "lichess", "config.yml")
+        else:
+            cfg_path = config_path
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        stripped = line.strip()
+                        if stripped.startswith("token:"):
+                            value = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                            if value and "LICHESS_BOT_TOKEN" not in value:
+                                return value
+            except OSError as exc:
+                logger.warning("could not read %s: %s", cfg_path, exc)
+        return None
+
+    @staticmethod
+    def _fmt_clock(ms) -> str:
+        """Format a Lichess clock (ms) as m:ss, or '--:--' if unknown."""
+        if ms is None or ms < 0:
+            return "--:--"
+        secs = int(ms) // 1000
+        return f"{secs // 60}:{secs % 60:02d}"
+
+    def _lichess_result_text(self, status: str, winner) -> str:
+        """Map a Lichess game-end status to a human-readable result."""
+        if status in ("aborted", "noStart"):
+            return "Game aborted"
+        if status in ("draw", "stalemate"):
+            return "Draw"
+        if status in ("mate", "resign", "outoftime", "timeout", "cheat"):
+            if self.lichess_game:
+                bot_white = self.lichess_game.get("bot_is_white", True)
+                bot_won = (winner == "white" and bot_white) or (winner == "black" and not bot_white)
+                return "You won!" if bot_won else "You lost"
+        return status.capitalize() if status else "Finished"
+
+    def _log_lichess(self, message: str) -> None:
+        """Append a human-readable event to the on-screen activity log (capped)."""
+        self.lichess_log.append(message)
+        if len(self.lichess_log) > 8:
+            self.lichess_log = self.lichess_log[-8:]
+        self.lichess_last_event_ticks = pygame.time.get_ticks()
+
+    @staticmethod
+    def _wrap_text(text: str, max_chars: int) -> list[str]:
+        """Greedy word-wrap into lines of at most ``max_chars`` characters."""
+        words = text.split()
+        lines: list[str] = []
+        current = ""
+        for word in words:
+            if len(current) + len(word) + (1 if current else 0) <= max_chars:
+                current = f"{current} {word}" if current else word
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines or [""]
+
+    def _start_lichess(self) -> None:
+        """Enter Lichess mode: validate token, start the controller, clear state."""
+        self.reset_game()
+        self.lichess_game = None
+        self.pending_challenge = None
+        self.review_mode = False
+        self.review_index = 0
+        self.lichess_log = []
+        self.lichess_last_move_text = ""
+        self.lichess_connected = False
+        self.lichess_last_event_ticks = pygame.time.get_ticks()
+        self.mode = "lichess"
+        token = self._get_lichess_token()
+        if not token:
+            self.lichess_controller = None
+            self.lichess_status = "No token. Set LICHESS_BOT_TOKEN env var."
+            self._log_lichess("No token found — set LICHESS_BOT_TOKEN.")
+            return
+        self.lichess_status = "Connecting..."
+        self._log_lichess("Connecting to Lichess...")
+        self.lichess_controller = LichessController(token)
+        self.lichess_controller.start()
+
+    def _stop_lichess_if_running(self) -> None:
+        if self.lichess_controller is not None:
+            self.lichess_controller.stop()
+            self.lichess_controller = None
+
+    def _drain_lichess_events(self) -> None:
+        """Move queued controller events into GUI state (main thread only)."""
+        if self.lichess_controller is None:
+            return
+        while True:
+            try:
+                event = self.lichess_controller.event_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_lichess_event(event)
+
+    def _handle_lichess_event(self, event) -> None:
+        # Any event proves the stream is alive — record it for the indicator.
+        self.lichess_last_event_ticks = pygame.time.get_ticks()
+        if isinstance(event, ChallengeReceived):
+            self.pending_challenge = event
+            self.lichess_status = f"Challenge from {event.opponent} ({event.speed})"
+            self._log_lichess(f"Challenge: {event.opponent} ({event.speed})")
+        elif isinstance(event, GameStarted):
+            self.lichess_game = {
+                "game_id": event.game_id,
+                "bot_is_white": event.bot_is_white,
+                "opponent_name": event.opponent_name,
+                "initial_fen": event.initial_fen,
+                "moves": list(event.moves),
+                "wtime": event.wtime,
+                "btime": event.btime,
+                "status": "started",
+                "winner": None,
+                "over": False,
+            }
+            self.pending_challenge = None
+            self.flipped = not event.bot_is_white  # show the bot's perspective
+            self.review_mode = False
+            self.review_index = 0
+            self.lichess_connected = True
+            self.lichess_last_move_text = ""
+            self.lichess_status = f"Playing {event.opponent_name}"
+            self._log_lichess(f"Game started vs {event.opponent_name}")
+            self._set_lichess_position(self.lichess_game["moves"])
+        elif isinstance(event, GameUpdated):
+            if self.lichess_game and self.lichess_game["game_id"] == event.game_id:
+                self.lichess_game["moves"] = list(event.moves)
+                self.lichess_game["wtime"] = event.wtime
+                self.lichess_game["btime"] = event.btime
+                self.lichess_game["status"] = event.status
+                self.lichess_game["winner"] = event.winner
+                over = self._controller_is_over(event.status)
+                self.lichess_game["over"] = over
+                if over:
+                    self.lichess_status = self._lichess_result_text(event.status, event.winner)
+                    self._log_lichess(f"Game over: {self.lichess_status}")
+                    self._enter_review()
+                else:
+                    self.lichess_status = f"Playing {self.lichess_game['opponent_name']}"
+                    moves = self.lichess_game["moves"]
+                    if moves:
+                        self.lichess_last_move_text = f"Move {len(moves)}: {moves[-1]}"
+                    self._set_lichess_position(self.lichess_game["moves"])
+        elif isinstance(event, EngineMoved):
+            if self.lichess_game and self.lichess_game["game_id"] == event.game_id \
+                    and not self.lichess_game["over"]:
+                # Optimistically show the engine's move; the next GameUpdated
+                # reconciles from the authoritative server move list.
+                self.lichess_game["moves"].append(event.uci)
+                self._set_lichess_position(self.lichess_game["moves"])
+                self.lichess_status = f"Engine played {event.uci}"
+                self.lichess_last_move_text = f"Move {len(self.lichess_game['moves'])}: {event.uci}"
+        elif isinstance(event, GameFinished):
+            if self.lichess_game and self.lichess_game["game_id"] == event.game_id:
+                self.lichess_game["moves"] = list(event.moves)
+                self.lichess_game["status"] = event.status
+                self.lichess_game["winner"] = event.winner
+                self.lichess_game["over"] = True
+                self.lichess_status = self._lichess_result_text(event.status, event.winner)
+                self._log_lichess(f"Game over: {self.lichess_status}")
+                self._enter_review()
+            elif self.lichess_game is None:
+                self.lichess_status = f"Game {event.game_id} finished"
+                self._log_lichess(f"Game {event.game_id} finished")
+        elif isinstance(event, Status):
+            # "Connected as ..." is meaningful (log it + show instructions);
+            # "Engine thinking..." is transient (just display it, don't log).
+            if event.message.startswith("Connected as"):
+                self.lichess_connected = True
+                self.lichess_status = f"{event.message} — waiting for challenges"
+                self._log_lichess(event.message)
+            else:
+                self.lichess_status = event.message
+        elif isinstance(event, Error):
+            self.lichess_status = f"Error: {event.message}"
+            self._log_lichess(f"Error: {event.message}")
+            logger.warning("lichess error: %s", event.message)
+
+    @staticmethod
+    def _controller_is_over(status: str) -> bool:
+        return LichessController.is_game_over_status(status)
+
+    def _enter_review(self) -> None:
+        """Switch to review mode at the end of the live game."""
+        self.review_mode = True
+        self.review_index = len(self.lichess_game["moves"]) if self.lichess_game else 0
+        self._set_lichess_position(
+            self.lichess_game["moves"][:self.review_index] if self.lichess_game else []
+        )
+
+    def _set_lichess_position(self, moves_to_apply: list[str]) -> None:
+        """Rebuild ``self.game`` from the Lichess initial FEN + a UCI move list.
+
+        Full rebuild each call (matches the controller) — robust to missed
+        events and to optimistic EngineMoved appends. Also refreshes
+        move_history, last_move, and captured pieces for the panel/board.
+        """
+        if self.lichess_game is None:
+            return
+        game = GameState(Board.from_fen(self.lichess_game["initial_fen"]))
+        history: list[str] = []
+        last_move: Move | None = None
+        captured_white: list[str] = []
+        captured_black: list[str] = []
+        for uci in moves_to_apply:
+            move = uci_to_move(uci)
+            from_r, from_c, to_r, to_c, _ = move
+            notation = move_to_algebraic(game.board, move)
+            moving = game.board.get_piece(from_r, from_c)
+            captured = game.board.get_piece(to_r, to_c)
+            if moving is not None and moving[1] == "P" and from_c != to_c and captured is None:
+                ep = game.board.get_piece(from_r, to_c)
+                if ep is not None:
+                    captured = ep
+            game.make_move(move)
+            history.append(notation)
+            last_move = move
+            if captured is not None:
+                (captured_white if captured[0] == "w" else captured_black).append(captured)
+        self.game = game
+        self.move_history = history
+        self.last_move = last_move
+        self.captured_white = captured_white
+        self.captured_black = captured_black
+        self.selected_square = None
+        self.legal_moves_for_selected = []
+
+    # --- Lichess button actions (called from the main thread) ------------
+
+    def _accept_challenge(self) -> None:
+        if self.pending_challenge and self.lichess_controller:
+            self.lichess_controller.accept_challenge(self.pending_challenge.challenge_id)
+            self.lichess_status = "Challenge accepted — waiting for game..."
+            self._log_lichess(f"Accepted challenge from {self.pending_challenge.opponent}")
+            self.pending_challenge = None
+
+    def _decline_challenge(self) -> None:
+        if self.pending_challenge and self.lichess_controller:
+            self.lichess_controller.decline_challenge(self.pending_challenge.challenge_id)
+            self.lichess_status = "Challenge declined"
+            self._log_lichess(f"Declined challenge from {self.pending_challenge.opponent}")
+            self.pending_challenge = None
+
+    def _resign_lichess(self) -> None:
+        if self.lichess_game and self.lichess_controller and not self.lichess_game["over"]:
+            self.lichess_controller.resign(self.lichess_game["game_id"])
+
+    def _abort_lichess(self) -> None:
+        if self.lichess_game and self.lichess_controller and not self.lichess_game["over"]:
+            self.lichess_controller.abort(self.lichess_game["game_id"])
+
+    def _menu_from_lichess(self) -> None:
+        self._stop_lichess_if_running()
+        self.lichess_game = None
+        self.pending_challenge = None
+        self.review_mode = False
+        self.mode = "menu"
+
+    # --- Review mode navigation ------------------------------------------
+
+    def _apply_review(self) -> None:
+        if self.lichess_game is None:
+            return
+        self._set_lichess_position(self.lichess_game["moves"][:self.review_index])
+
+    def _review_home(self) -> None:
+        self.review_index = 0
+        self._apply_review()
+
+    def _review_prev(self) -> None:
+        if self.lichess_game:
+            self.review_index = max(0, self.review_index - 1)
+            self._apply_review()
+
+    def _review_next(self) -> None:
+        if self.lichess_game:
+            self.review_index = min(len(self.lichess_game["moves"]), self.review_index + 1)
+            self._apply_review()
+
+    def _review_end(self) -> None:
+        if self.lichess_game:
+            self.review_index = len(self.lichess_game["moves"])
+            self._apply_review()
 
     def square_from_pos(self, pos: tuple[int, int]) -> tuple[int, int]:
         """Convert screen position to board (row, col)."""
@@ -325,6 +651,9 @@ class ChessGUI:
 
     def draw_panel(self) -> None:
         """Draw the side panel with game info."""
+        if self.mode == "lichess":
+            self._draw_lichess_panel()
+            return
         panel_x = BOARD_SIZE
         pygame.draw.rect(self.screen, PANEL_COLOR, (panel_x, 0, PANEL_WIDTH, WINDOW_HEIGHT))
 
@@ -383,6 +712,104 @@ class ChessGUI:
         self._draw_button("New Game", panel_x + 10, WINDOW_HEIGHT - 70, 95, 28, self._new_game_action)
         self._draw_button("Flip", panel_x + 115, WINDOW_HEIGHT - 70, 95, 28, self._flip_color_action)
         self._draw_button("Undo", panel_x + 10, WINDOW_HEIGHT - 36, 95, 28, self._undo_action)
+
+    def _draw_lichess_panel(self) -> None:
+        """Side panel for AI vs Lichess mode.
+
+        Shows live state so the user can see what the bot is doing even while
+        idle: current status, a last-activity indicator (proves the stream is
+        alive), a recent activity log, idle instructions with the bot's URL,
+        and during a game the opponent, clocks, last move, and move history.
+        """
+        panel_x = BOARD_SIZE
+        pygame.draw.rect(self.screen, PANEL_COLOR, (panel_x, 0, PANEL_WIDTH, WINDOW_HEIGHT))
+        bx = panel_x + 10
+
+        title = self.large_font.render("vs Lichess", True, (255, 255, 255))
+        self.screen.blit(title, (bx, 10))
+
+        y = 44
+        # Status (wrapped to up to 2 lines)
+        for line in self._wrap_text(self.lichess_status, 30)[:2]:
+            self.screen.blit(self.small_font.render(line, True, TEXT_COLOR), (bx, y))
+            y += 18
+
+        # Last-activity indicator — proves the connection is live. Updates on
+        # every received event (including the ~7s Lichess keep-alive pulses).
+        if self.lichess_controller is not None:
+            elapsed = (pygame.time.get_ticks() - self.lichess_last_event_ticks) / 1000.0
+            activity = (f"Last activity: {elapsed/60:.0f}m ago"
+                        if elapsed >= 60 else f"Last activity: {elapsed:.0f}s ago")
+            self.screen.blit(self.small_font.render(activity, True, (130, 130, 130)), (bx, y))
+        y += 22
+
+        # Idle instructions: tell the user how to get a game.
+        if self.lichess_connected and self.lichess_game is None \
+                and self.pending_challenge is None and not self.review_mode:
+            username = self.lichess_controller.username if self.lichess_controller else ""
+            for line in self._wrap_text(
+                    "Waiting for a challenge. From another Lichess account,"
+                    " challenge this bot:", 30):
+                self.screen.blit(self.small_font.render(line, True, (200, 180, 120)), (bx, y))
+                y += 18
+            if username:
+                self.screen.blit(self.small_font.render(f"lichess.org/@/{username}",
+                                                        True, (120, 200, 255)), (bx, y))
+                y += 18
+            y += 4
+
+        # Activity log — what's going on (connected / challenge / game / over).
+        self.screen.blit(self.medium_font.render("Activity:", True, TEXT_COLOR), (bx, y))
+        y += 20
+        for line in self.lichess_log[-6:]:
+            if y > WINDOW_HEIGHT - 200:
+                break
+            self.screen.blit(self.small_font.render(line[:30], True, (170, 170, 170)), (bx, y))
+            y += 17
+
+        # Game block (active game or review): opponent, clocks, last move, moves.
+        if self.lichess_game:
+            y = WINDOW_HEIGHT - 190
+            opp = str(self.lichess_game.get("opponent_name", "?"))
+            self.screen.blit(self.small_font.render(f"Opp: {opp[:20]}", True, TEXT_COLOR), (bx, y))
+            y += 20
+            wclk = self._fmt_clock(self.lichess_game.get("wtime"))
+            bclk = self._fmt_clock(self.lichess_game.get("btime"))
+            self.screen.blit(self.small_font.render(f"W clock: {wclk}", True, (255, 255, 255)),
+                             (bx, y))
+            y += 18
+            self.screen.blit(self.small_font.render(f"B clock: {bclk}", True, (180, 180, 180)),
+                             (bx, y))
+            y += 18
+            if self.lichess_last_move_text:
+                self.screen.blit(self.small_font.render(self.lichess_last_move_text[:28],
+                                                        True, (180, 180, 180)), (bx, y))
+                y += 18
+            self.screen.blit(self.small_font.render("Moves:", True, TEXT_COLOR), (bx, y))
+            y += 18
+            for notation in self.move_history[-6:]:
+                if y > WINDOW_HEIGHT - 116:
+                    break
+                self.screen.blit(self.small_font.render(notation[:24], True, (170, 170, 170)),
+                                 (bx, y))
+                y += 16
+
+        # Buttons — re-registered every frame (GUI_BUTTON_PATTERN)
+        if self.pending_challenge is not None:
+            self._draw_button("Accept", bx, WINDOW_HEIGHT - 104, 95, 28, self._accept_challenge)
+            self._draw_button("Decline", bx + 100, WINDOW_HEIGHT - 104, 95, 28,
+                              self._decline_challenge)
+        elif self.lichess_game and not self.lichess_game.get("over") and not self.review_mode:
+            self._draw_button("Resign", bx, WINDOW_HEIGHT - 104, 95, 28, self._resign_lichess)
+            self._draw_button("Abort", bx + 100, WINDOW_HEIGHT - 104, 95, 28, self._abort_lichess)
+
+        if self.review_mode:
+            self._draw_button("<<", bx, WINDOW_HEIGHT - 70, 45, 28, self._review_home)
+            self._draw_button("<", bx + 50, WINDOW_HEIGHT - 70, 45, 28, self._review_prev)
+            self._draw_button(">", bx + 100, WINDOW_HEIGHT - 70, 45, 28, self._review_next)
+            self._draw_button(">>", bx + 150, WINDOW_HEIGHT - 70, 45, 28, self._review_end)
+
+        self._draw_button("Menu", bx, WINDOW_HEIGHT - 36, 200, 28, self._menu_from_lichess)
 
     def _draw_promotion_dialog(self) -> None:
         """Draw promotion piece selection dialog."""
@@ -510,6 +937,8 @@ class ChessGUI:
                          lambda: self._start_game("b"))
         self._draw_button("Engine vs Engine", WINDOW_WIDTH // 2 - 100, 320, 200, 40,
                          lambda: self._start_game("engine_vs_engine"))
+        self._draw_button("AI vs Lichess", WINDOW_WIDTH // 2 - 100, 380, 200, 40,
+                         self._start_lichess)
 
     def _start_game(self, mode: str) -> None:
         if mode == "engine_vs_engine":
@@ -528,6 +957,7 @@ class ChessGUI:
             # Process events using previous frame's button positions
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
+                    self._stop_lichess_if_running()
                     running = False
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:
@@ -537,16 +967,23 @@ class ChessGUI:
                         elif self.mode == "menu":
                             self.handle_button_click(event.pos)
                         else:
-                            # Check buttons first
+                            # Check buttons first (covers lichess panel buttons)
                             self.handle_button_click(event.pos)
                             if self.mode == "play":
                                 self.handle_click(event.pos)
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_n:
+                        self._stop_lichess_if_running()
                         self.reset_game()
                         self.mode = "menu"
-                    elif event.key == pygame.K_u:
+                    elif event.key == pygame.K_u and self.mode != "lichess":
                         self._undo_action()
+                    elif event.key == pygame.K_LEFT and self.mode == "lichess" \
+                            and self.review_mode:
+                        self._review_prev()
+                    elif event.key == pygame.K_RIGHT and self.mode == "lichess" \
+                            and self.review_mode:
+                        self._review_next()
 
             # Clear button list before redrawing
             self._buttons = []
@@ -555,11 +992,17 @@ class ChessGUI:
             if self.mode == "menu":
                 self.draw_menu()
             else:
+                # Lichess mode: drain background events into GUI state first
+                if self.mode == "lichess":
+                    self._drain_lichess_events()
+
                 self.draw_board()
                 self.draw_panel()
 
-                # Engine move
-                if not self.game_over and not self.is_engine_thinking:
+                # Local engine move scheduling — never in lichess mode
+                # (the controller's threads handle engine moves there).
+                if self.mode != "lichess" and not self.game_over \
+                        and not self.is_engine_thinking:
                     if self.mode == "engine_vs_engine":
                         current_time = pygame.time.get_ticks()
                         if current_time - self.last_engine_move_time > self.engine_vs_engine_delay:

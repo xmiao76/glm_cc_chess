@@ -9,6 +9,8 @@ from src.moves import (
     is_checkmate,
     is_stalemate,
     move_to_algebraic,
+    move_to_uci,
+    uci_to_move,
 )
 
 
@@ -256,3 +258,75 @@ class TestMoveNotation:
         move = (7, 4, 7, 2, None)
         notation = move_to_algebraic(board, move)
         assert notation == "O-O-O"
+
+
+class TestUciConversion:
+    """Round-trip and edge-case tests for move_to_uci / uci_to_move."""
+
+    def test_pawn_move(self):
+        assert move_to_uci((6, 4, 4, 4, None)) == "e2e4"
+        assert uci_to_move("e2e4") == (6, 4, 4, 4, None)
+
+    def test_knight_move(self):
+        # Ng1-f3 = (7,6) -> (5,5)
+        assert move_to_uci((7, 6, 5, 5, None)) == "g1f3"
+        assert uci_to_move("g1f3") == (7, 6, 5, 5, None)
+
+    def test_castling_kingside(self):
+        # White O-O: e1g1 (king from e1 to g1)
+        assert move_to_uci((7, 4, 7, 6, None)) == "e1g1"
+        assert uci_to_move("e1g1") == (7, 4, 7, 6, None)
+
+    def test_castling_queenside(self):
+        # White O-O-O: e1c1
+        assert move_to_uci((7, 4, 7, 2, None)) == "e1c1"
+        assert uci_to_move("e1c1") == (7, 4, 7, 2, None)
+
+    def test_promotion_lowercase_in_uci(self):
+        # Internal promo is uppercase "Q"; UCI is lowercase "q"
+        assert move_to_uci((1, 4, 0, 4, "Q")) == "e7e8q"
+        assert move_to_uci((1, 4, 0, 4, "R")) == "e7e8r"
+        assert uci_to_move("e7e8q") == (1, 4, 0, 4, "Q")
+        assert uci_to_move("a7a8n") == (1, 0, 0, 0, "N")
+
+    def test_promotion_capture(self):
+        # Pawn on b7 captures a8 promoting: b7a8q
+        assert uci_to_move("b7a8q") == (1, 1, 0, 0, "Q")
+
+    def test_en_passant_is_plain_from_to(self):
+        # En passant in UCI is just the pawn's from-to (e5d6); make_move infers it.
+        assert uci_to_move("e5d6") == (3, 4, 2, 3, None)
+        assert move_to_uci((3, 4, 2, 3, None)) == "e5d6"
+
+    def test_roundtrip_random_legal_moves(self):
+        """Every legal move in several positions round-trips through UCI."""
+        positions = [
+            STARTING_FEN,
+            "r1bqkbnr/pppppppp/2n5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 1 2",
+            "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1",
+        ]
+        for fen in positions:
+            board = Board.from_fen(fen)
+            for move in generate_legal_moves(board, board.active_color):
+                uci = move_to_uci(move)
+                # UCI length is 4 (quiet/castle/ep) or 5 (promotion)
+                assert len(uci) in (4, 5)
+                assert uci_to_move(uci) == move
+
+    def test_uci_applied_matches_internal_move(self):
+        """Applying a UCI move via uci_to_move + GameState matches the move."""
+        from src.game import GameState
+        for fen in [STARTING_FEN, "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"]:
+            board = Board.from_fen(fen)
+            for move in generate_legal_moves(board, board.active_color):
+                g_direct = GameState(Board.from_fen(fen))
+                g_uci = GameState(Board.from_fen(fen))
+                g_direct.make_move(move)
+                g_uci.make_move(uci_to_move(move_to_uci(move)))
+                assert g_direct.board.to_fen() == g_uci.board.to_fen()
+
+    def test_null_move_rejected(self):
+        with pytest.raises(ValueError):
+            uci_to_move("0000")
+        with pytest.raises(ValueError):
+            uci_to_move("")
