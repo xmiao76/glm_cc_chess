@@ -12,3 +12,7 @@ lichess/config.yml
 .lichess_token
 *.token
 lichess_bot.log
+*.pyc
+.coverage
+*.pyc
+*.pyc
