@@ -82,6 +82,54 @@ python -m src.main
 On first run, Windows Firewall may prompt for network access — allow it so the
 bot can reach `lichess.org`.
 
+### Initiating games & auto-match
+
+By default the bot only **waits** for challenges — so two bots left idle will
+deadlock forever, each waiting for the other. The bot can now **create**
+challenges and **auto-match**:
+
+- **Challenge (manual):** type a Lichess username in the **Opponent** field and
+  click **Challenge**. The bot sends `POST /api/challenge/{username}` once and
+  waits for the opponent to accept. Use this to play any specific bot.
+- **Auto (toggle):** click **Auto** to turn on auto-match. The bot then
+  (a) auto-accepts incoming challenges from the opponent in the field, and
+  (b) periodically re-issues a challenge to them while idle.
+
+**Two of these programs auto-matching:** set each program's **Opponent** to the
+*other* bot's username and turn **Auto** on for both. A deterministic
+leader/follower rule (the bot whose username sorts *first* alphabetically is the
+one that challenges) guarantees **exactly one game** starts — never two. The
+other bot simply auto-accepts. You do not need to choose who initiates.
+
+While a game is in progress the bot stops challenging and cancels any pending
+outgoing challenge; after the game it resumes. Only one game is played at a
+time, and only peers named in the field are auto-accepted (random challengers
+are still shown for manual Accept/Decline).
+
+These settings can be preset via environment variables so a launch is fully
+automatic (no typing):
+
+| Env var | Meaning | Default |
+|---|---|---|
+| `LICHESS_OPPONENT` | Opponent username to challenge / accept from | _(none)_ |
+| `LICHESS_AUTO_MATCH` | `1`/`true` to enable auto-match on launch | off |
+| `LICHESS_CLOCK_LIMIT` | Clock initial time in seconds | `300` (5 min) |
+| `LICHESS_CLOCK_INCREMENT` | Increment per move in seconds | `3` |
+
+Example — two bots, fully automatic from launch:
+
+```bash
+# Terminal 1 (bot "alpha")
+LICHESS_OPPONENT=beta LICHESS_AUTO_MATCH=1 LICHESS_BOT_TOKEN=<alpha_token> python -m src.main
+# Terminal 2 (bot "beta")
+LICHESS_OPPONENT=alpha LICHESS_AUTO_MATCH=1 LICHESS_BOT_TOKEN=<beta_token> python -m src.main
+```
+(`alpha` challenges `beta`, since "alpha" < "beta"; `beta` auto-accepts.)
+
+> ⚠️ Be a good Lichess citizen: auto-match only against bots you control or have
+> arranged a match with, play honestly, and don't spam challenges. The default
+> 30 s period and cancel-before-reissue keep challenge volume low.
+
 ## 4. Test the UCI engine locally first
 
 Before connecting to Lichess, verify the engine speaks UCI correctly:
@@ -140,6 +188,15 @@ curl https://lichess.org/api/game/export/<gameId> \
 The in-code client also exposes `LichessClient.get_game_pgn(game_id)`. Lichess
 game IDs are shown in the GUI status and in the lichess-bot logs. There is no
 automated rating evaluation in this project — collect results manually.
+
+### Copying the activity log
+
+In **AI vs Lichess** mode the side panel shows an **Activity** log. Click the
+**Copy Log** button next to the *Activity:* header to copy the full,
+untruncated log (the on-screen lines are truncated to 30 chars) to the system
+clipboard, prefixed with `@<bot> — <status>`. Paste it into a bug report or
+support request. If the clipboard is unavailable, the log is written to
+`lichess_activity_log.txt` in the working directory instead.
 
 ## 7. Lichess Terms of Service
 

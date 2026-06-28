@@ -10,17 +10,36 @@ import logging
 import os
 import queue
 import sys
+import time
 import pygame
 from src.board import Board, STARTING_FEN
 from src.game import GameState
 from src.moves import generate_legal_moves, move_to_algebraic, uci_to_move, Move
 from src.engine import ChessEngine, choose_move
 from src.lichess_controller import (
-    LichessController, ChallengeReceived, GameStarted, GameUpdated,
-    EngineMoved, GameFinished, Status, Error,
+    LichessController, ChallengeReceived, ChallengeSent, GameStarted,
+    GameUpdated, EngineMoved, GameFinished, Status, Error,
 )
+from src.gui_textinput import TextInput
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    """Read an integer env var, falling back to ``default`` on absence/parse error."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("ignoring invalid %s=%r (expected int)", name, raw)
+        return default
+
+
+def _parse_bool_env(name: str) -> bool:
+    """Read a boolean env var (``1``/``true``/``yes``/``on``)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _resource_path(relative_path: str) -> str:
@@ -38,6 +57,23 @@ SQUARE_SIZE = 80
 BOARD_SIZE = SQUARE_SIZE * 8
 PANEL_WIDTH = 220
 WINDOW_WIDTH = BOARD_SIZE + PANEL_WIDTH
+# Seconds with no first move before we proactively warn that the side to move
+# first isn't playing. Lichess aborts a game after ~15-30s with no first move, so
+# 20s gives a heads-up just before the abort.
+NO_FIRST_MOVE_WARN_S = 20
+# Lichess statuses that mean "the game didn't get played". ``aborted`` is a
+# mid/start abort by a player or the no-first-move timeout; ``noStart`` means
+# Lichess aborted it BEFORE it started (a creation-time conflict — e.g. a
+# duplicate event-stream connection). Both render as "Game aborted" but have
+# different causes, so the diagnostic logs the actual status.
+ABORT_LIKE_STATUSES = ("aborted", "noStart")
+# A 0-move game that ends this fast after GameStarted was NOT aborted by the
+# ~15-30s no-first-move timeout — the gameFull arrived already over (an instant
+# abort at creation, e.g. a duplicate event-stream connection conflict). Used
+# only for the Black case: when we're Black we never start thinking (we wait on
+# White), so engine_started can't tell instant-abort from a real timeout, but
+# the elapsed time can (sub-second vs ~15-30s).
+INSTANT_ABORT_THRESHOLD_S = 5
 WINDOW_HEIGHT = BOARD_SIZE
 FPS = 60
 
@@ -113,6 +149,12 @@ class ChessGUI:
         self.lichess_last_event_ticks = 0  # pygame ticks of last received event
         self.lichess_last_move_text = ""  # e.g. "Move 12: e2e4"
         self.lichess_connected = False
+        # Challenge initiation + auto-match UI state
+        self.lichess_opponent = ""  # committed opponent username
+        self.lichess_auto = False  # auto-match (challenge + accept) toggle
+        self.lichess_clock_limit_s = 300
+        self.lichess_clock_increment_s = 3
+        self.lichess_opponent_field: TextInput | None = None
 
         # Pre-render piece surfaces
         self.piece_surfaces: dict[str, pygame.Surface] = {}
@@ -201,7 +243,7 @@ class ChessGUI:
 
     def _lichess_result_text(self, status: str, winner) -> str:
         """Map a Lichess game-end status to a human-readable result."""
-        if status in ("aborted", "noStart"):
+        if status in ABORT_LIKE_STATUSES:
             return "Game aborted"
         if status in ("draw", "stalemate"):
             return "Draw"
@@ -213,11 +255,300 @@ class ChessGUI:
         return status.capitalize() if status else "Finished"
 
     def _log_lichess(self, message: str) -> None:
-        """Append a human-readable event to the on-screen activity log (capped)."""
-        self.lichess_log.append(message)
-        if len(self.lichess_log) > 8:
-            self.lichess_log = self.lichess_log[-8:]
+        """Append a human-readable event to the on-screen activity log (capped).
+
+        Each line is prefixed with a wall-clock ``HH:MM:SS`` timestamp (matching
+        the opponent lichess-bot's log format) so the two logs can be correlated
+        and — crucially — the same-second "instant abort at creation" timing is
+        visible. That timing is the evidence that distinguishes an instant abort
+        (a duplicate-connection conflict) from the ~15-30s no-first-move timeout.
+        """
+        stamp = time.strftime("%H:%M:%S")
+        self.lichess_log.append(f"{stamp} {message}")
+        # Keep a generous rolling history so Copy Log captures the FULL sequence
+        # of a game (challenge -> GameStarted -> ... -> abort diagnostic), not
+        # just the last few lines — the challenge line is the evidence that we
+        # sent exactly one challenge, and it must survive until the user copies.
+        # The on-screen panel renders only the tail (see _draw_lichess_panel).
+        if len(self.lichess_log) > 100:
+            self.lichess_log = self.lichess_log[-100:]
         self.lichess_last_event_ticks = pygame.time.get_ticks()
+
+    def _log_abort_diagnostic(self) -> None:
+        """Log a tailored explanation of why the game was aborted/noStart.
+
+        Uses the ACTUAL Lichess status — ``noStart`` (aborted BEFORE it started,
+        a creation-time conflict) is a different cause from ``aborted`` (a
+        player/no-first-move abort) — plus how many moves were played, which
+        color we were, whether we ever started thinking, and how long the game
+        lasted.
+        """
+        game = self.lichess_game or {}
+        moves_played = len(game.get("moves", []))
+        bot_is_white = game.get("bot_is_white")
+        opp = game.get("opponent_name", "the opponent")
+        engine_started = bool(game.get("engine_started"))
+        status = str(game.get("status") or "aborted")
+        started = game.get("started_ticks")
+        dur = ""
+        elapsed_s: float | None = None
+        if started is not None:
+            elapsed_s = max(0.0, (pygame.time.get_ticks() - started) / 1000.0)
+            # Sub-second precision matters for the instant-abort-at-creation
+            # case (the game aborted in the same second it started); >=1s rounds.
+            if elapsed_s >= 1:
+                dur = f" after {elapsed_s:.0f}s"
+            else:
+                dur = f" within {elapsed_s:.1f}s of start"
+        if status == "noStart":
+            # Lichess aborted the game BEFORE it started — a creation-time
+            # conflict, NOT the ~15-30s no-first-move timeout. The game was
+            # dead-on-arrival: neither side moved, regardless of color. The
+            # candidate cause is a duplicate event-stream connection on one of
+            # the accounts (UNPROVEN for single-receipt games): two bot instances
+            # on one account both receive the gameStart (Lichess pushes it to every
+            # live stream) and both connect to the same game's stream, and the
+            # conflict aborts it at creation — this happens whether our one
+            # challenge was received once or twice (the gameStart, not the
+            # challenge, is what double-connects the game stream). The 'Connected
+            # as <name>' line count does NOT prove a duplicate (lichess-bot logs
+            # 'Connected' on each reconnect, so two lines can be one process); the
+            # decisive check is the bot PROCESS count on both machines.
+            us = "White (we move first)" if bot_is_white else "Black (waiting on White)"
+            self._log_lichess(
+                f"Game never started{dur} — Lichess status 'noStart' (aborted "
+                f"BEFORE it started, NOT a no-first-move timeout). We were {us} "
+                f"but the gameFull arrived already over, so neither side moved. "
+                f"This is a creation-time conflict, consistent with a DUPLICATE "
+                f"event-stream connection on one of the accounts (a CANDIDATE "
+                f"cause, not proven) — two bot instances on one account both "
+                f"receive the gameStart (Lichess pushes it to every "
+                f"live stream) and both connect to the same game's stream, and "
+                f"the conflict aborts it at creation, whether our one challenge "
+                f"was received once or twice (the gameStart, not the challenge, "
+                f"is what double-connects). But the 'Connected as <name>' line "
+                f"count does NOT prove a duplicate — lichess-bot logs 'Connected' "
+                f"on each reconnect, so two 'Connected as {opp}' lines can be ONE "
+                f"process, not two (our side shows ONE 'Connected as xmiao_glm' + "
+                f"one challenge id — clean). The decisive check is the bot PROCESS "
+                f"count on BOTH machines (Task Manager), not the 'Connected' line "
+                f"count. Run only ONE bot process per account "
+                f"— a second process for EITHER account double-connects and "
+                f"aborts every game (e.g. lichess-bot for xmiao_glm alongside "
+                f"this GUI, or two lichess-bot instances for {opp}). Check Task "
+                f"Manager for extra python/lichess-bot processes; if there's only "
+                f"one, it is reconnecting its stream — run {opp} in this GUI too "
+                f"(one clean connection).")
+            return
+        if moves_played == 0:
+            if bot_is_white:
+                # We were White (we move first) yet nothing was played. The two
+                # causes are distinct, so they get distinct messages.
+                if engine_started:
+                    # We were thinking when the game died — the gameFull was LIVE
+                    # (we reached _maybe_move), so the opponent aborted during our
+                    # think before the first move landed. May be a manual abort, or
+                    # the duplicate-connection conflict: two bot instances on one
+                    # account both receive the gameStart and both connect to the
+                    # game's stream, and the conflict aborts the game mid-think
+                    # (whether our one challenge was received once or twice).
+                    self._log_lichess(
+                        f"Aborted{dur} with no moves played — we were White (we "
+                        f"move first). We had started thinking, but the opponent "
+                        f"aborted before our first move landed. If EITHER side has "
+                        f"a second bot process (check Task Manager — NOT the "
+                        f"'Connected as <name>' line count, since lichess-bot logs "
+                        f"'Connected' on each reconnect), that side is running a "
+                        f"DUPLICATE event-stream connection — two bot instances on "
+                        f"one account both receive the gameStart and both connect to "
+                        f"the same game's stream, and the conflict aborts it at the "
+                        f"start (whether our one challenge was received once or "
+                        f"twice). Run only ONE bot process per account — a "
+                        f"second process for EITHER account double-connects and "
+                        f"aborts every game (e.g. lichess-bot for xmiao_glm "
+                        f"alongside this GUI, or two lichess-bot instances for "
+                        f"{opp}). Check Task Manager for extra python/lichess-bot "
+                        f"processes; if there's only one, it is reconnecting its "
+                        f"stream — run {opp} in this GUI too (one clean "
+                        f"connection).")
+                else:
+                    # We never started thinking — the gameFull arrived already over
+                    # (instant abort at creation). That timing — sub-second, 0 moves,
+                    # gameFull already over — is consistent with a DUPLICATE
+                    # event-stream connection on one of the accounts (a CANDIDATE
+                    # cause, not proven): two bot instances on one account both
+                    # receive the gameStart (Lichess pushes it to every live stream)
+                    # and both connect to this game's stream, and Lichess aborts the
+                    # conflict at creation — this happens whether our one challenge
+                    # was received once or twice (the gameStart, not the challenge, is
+                    # what double-connects the game stream). The 'Connected as <name>'
+                    # line count does NOT prove a duplicate (lichess-bot logs
+                    # 'Connected' on each reconnect, so two lines can be one process);
+                    # the decisive check is the bot PROCESS count on both machines.
+                    self._log_lichess(
+                        f"Aborted{dur} with no moves played — we were White (we "
+                        f"move first). We never started thinking — the game was "
+                        f"already over when we connected (the gameFull carried a "
+                        f"'{status}' status). That timing — sub-second, 0 moves, "
+                        f"gameFull already over — is consistent with a DUPLICATE "
+                        f"event-stream connection on one of the accounts (a CANDIDATE "
+                        f"cause, not proven): two bot instances on one account both "
+                        f"receive the gameStart "
+                        f"(Lichess pushes it to every live stream) and both connect "
+                        f"to this game's stream, and Lichess aborts the conflict at "
+                        f"creation — whether our one challenge was received once or "
+                        f"twice (the gameStart, not the challenge, is what "
+                        f"double-connects). But the 'Connected as <name>' line "
+                        f"count does NOT prove a duplicate — lichess-bot logs "
+                        f"'Connected' on each reconnect, so two 'Connected as {opp}' "
+                        f"lines can be ONE process, not two (our side shows ONE "
+                        f"'Connected as xmiao_glm' + one challenge id — clean). The "
+                        f"decisive check is the bot PROCESS count on BOTH machines "
+                        f"(Task Manager), not the 'Connected' line count. Run only ONE bot process "
+                        f"per account — a second process for EITHER account "
+                        f"double-connects and aborts every game (e.g. lichess-bot "
+                        f"for xmiao_glm alongside this GUI, or two lichess-bot "
+                        f"instances for {opp}). Check Task Manager for extra "
+                        f"python/lichess-bot processes; if there's only one, it is "
+                        f"reconnecting its stream — run {opp} in this GUI too (one "
+                        f"clean connection).")
+            else:
+                # We were Black, waiting for White to move first. We never start
+                # thinking while Black (not our turn until White moves), so
+                # engine_started can't tell the causes apart — the elapsed time
+                # can. Three regimes by elapsed:
+                #  - sub-second: the gameFull arrived already over (instant abort
+                #    at creation — a duplicate event-stream conflict).
+                #  - a few seconds, but under the ~15-30s no-first-move timeout:
+                #    the game was LIVE then aborted mid-way before White's first
+                #    move — a conflict (one account connected to the game stream
+                #    twice) or a manual Abort. NOT a timeout, NOT instant.
+                #  - >= NO_FIRST_MOVE_WARN_S: White never moved -> the genuine
+                #    no-first-move timeout (the stall warning would have fired).
+                instant = elapsed_s is not None and elapsed_s < INSTANT_ABORT_THRESHOLD_S
+                stalled = elapsed_s is not None and elapsed_s >= NO_FIRST_MOVE_WARN_S
+                if instant:
+                    # IMPORTANT: "already over when we connected" does NOT prove
+                    # the game was aborted at creation. Our elapsed clock starts
+                    # when WE connect, so a game that actually lived a few
+                    # seconds (a mid-think abort while White was thinking) and
+                    # that we connected to slightly late produces the IDENTICAL
+                    # signature on our side — game LtnFaUxZ (2026-06-28) turned
+                    # out to be exactly that (the opponent logged "Engine
+                    # thinking" + status "started", then its move got "game
+                    # already over"). So we must NOT assert "instant abort at
+                    # creation" as fact; we name the limitation, demote the
+                    # duplicate-stream candidate (both sides were single-instance
+                    # in recent cycles), add the Lichess-side same-owner/same-IP
+                    # candidate, and point at the decisive experiments.
+                    self._log_lichess(
+                        f"Aborted{dur} with no moves played — we were Black "
+                        f"(waiting for White). The gameFull arrived already over "
+                        f"when we connected (it carried a '{status}' status), so 0 "
+                        f"moves were played. KEY LIMITATION: 'already over when we "
+                        f"connected' does NOT prove the game was aborted at "
+                        f"creation — our elapsed clock starts when WE connect, so a "
+                        f"game that actually lived a few seconds (a mid-think abort "
+                        f"while White was thinking) and that we connected to "
+                        f"slightly late produces the IDENTICAL signature on our "
+                        f"side; we cannot tell the two apart from our log alone "
+                        f"(cross-check the opponent's log: did it show 'Engine "
+                        f"thinking'/'started' before the abort?). Candidate causes "
+                        f"(NONE proven): (1) a DUPLICATE event-stream connection on "
+                        f"one account — two bot instances on one account both "
+                        f"receive the gameStart and both connect to this game's "
+                        f"stream, and Lichess aborts the conflict, whether our one "
+                        f"challenge was received once or twice (the gameStart, not "
+                        f"the challenge, double-connects). This candidate is now "
+                        f"WEAKENED: recent cycles had BOTH sides confirmed "
+                        f"single-instance (singleton lock + one PID + one challenge "
+                        f"id + single receipt/accept), so a two-process duplicate is "
+                        f"largely ruled out — though a silently-deduped second "
+                        f"stream on the opponent's ({opp}) side remains possible. "
+                        f"(2) A Lichess-side abort for two bots owned by the same "
+                        f"person / on the same public IP — an UNVERIFIED "
+                        f"server-side rule (no documented policy); it fits the "
+                        f"recurring pattern of 0-move aborts across colors and "
+                        f"orderings that survive every duplicate fix. The 'Connected "
+                        f"as <name>' line count does NOT prove a duplicate "
+                        f"(lichess-bot logs 'Connected' on each reconnect, so two "
+                        f"lines can be one process). Decisive experiments to "
+                        f"actually prove the cause: (a) have the opponent play a "
+                        f"THIRD-PARTY bot (not owned by you) from the same machine "
+                        f"— if it plays normally, the cause is the same-owner "
+                        f"pairing, not a code bug; (b) run the two bots on DIFFERENT "
+                        f"networks/public IPs — if games then play, same-IP was a "
+                        f"factor. Meanwhile, run only ONE bot process per account "
+                        f"(a second double-connects and aborts every game).")
+                elif not stalled:
+                    # Mid-think abort: the game was live, then aborted at a few
+                    # seconds — before the timeout and after creation. Our single
+                    # instance cannot cause this (gameStart is deduped, and abort
+                    # is only the manual button), so it's a second connection on
+                    # one account or a manual Abort — NOT "opponent not playing".
+                    self._log_lichess(
+                        f"Aborted{dur} with no moves played — we were Black, "
+                        f"waiting for White. The game was LIVE but aborted before "
+                        f"White's first move landed and well before the ~15-30s "
+                        f"no-first-move timeout (the 20s stall warning never "
+                        f"fired) — so this is NOT a timeout and NOT an "
+                        f"instant-at-creation abort: the game was aborted mid-way. "
+                        f"Two causes: (1) one account connected to the game stream "
+                        f"TWO times — a second GUI window, lichess-bot for "
+                        f"xmiao_glm alongside this GUI, or the opponent ({opp}) "
+                        f"running two bot processes — and Lichess aborted the "
+                        f"conflict; or (2) the Abort button was clicked. If you "
+                        f"did not click Abort, check Task Manager for extra "
+                        f"python/lichess-bot processes on EITHER account (one "
+                        f"connection per account; a second double-connects the "
+                        f"game stream and aborts every game).")
+                else:
+                    self._log_lichess(
+                        f"Aborted{dur} with no moves played — White ({opp}) never "
+                        "made the first move. Lichess aborts a game automatically "
+                        "if no first move is made within ~15-30s, so the opponent "
+                        "bot is not playing: it is not running, not upgraded to a "
+                        "Bot account, or its engine failed to start. Check that "
+                        "bot.")
+        else:
+            self._log_lichess(
+                f"Aborted{dur} — a player aborted the game mid-way "
+                f"({moves_played} move(s) played).")
+
+    def _warn_if_opponent_stalled(self) -> None:
+        """Proactively warn when the side to move first hasn't, before the abort.
+
+        Called once per frame from the main loop. If the game is live, no move has
+        been played, and NO_FIRST_MOVE_WARN_S have elapsed, log one warning so the
+        activity log shows the stall *before* the abort lands (the abort message
+        alone arrives too late to be actionable).
+        """
+        game = self.lichess_game
+        if not game or game.get("over"):
+            return
+        if game.get("no_first_move_warned"):
+            return
+        if game.get("moves"):  # at least one move — game is progressing
+            return
+        started = game.get("started_ticks")
+        if not started:
+            return
+        elapsed = (pygame.time.get_ticks() - started) / 1000.0
+        if elapsed < NO_FIRST_MOVE_WARN_S:
+            return
+        game["no_first_move_warned"] = True
+        bot_is_white = game.get("bot_is_white")
+        opp = game.get("opponent_name", "the opponent")
+        if bot_is_white:
+            self._log_lichess(
+                f"No first move after {elapsed:.0f}s — we are White and haven't "
+                "moved. Our engine may be stuck; the game will abort soon if no "
+                "move is made.")
+        else:
+            self._log_lichess(
+                f"No first move after {elapsed:.0f}s — White ({opp}) hasn't "
+                "moved. The opponent bot isn't playing; the game will abort "
+                "soon (~15-30s no-first-move rule) if White doesn't move.")
 
     @staticmethod
     def _wrap_text(text: str, max_chars: int) -> list[str]:
@@ -238,6 +569,13 @@ class ChessGUI:
 
     def _start_lichess(self) -> None:
         """Enter Lichess mode: validate token, start the controller, clear state."""
+        # Stop any controller still running before creating a new one. ``stop()``
+        # only sets a flag (the daemon threads/HTTP connections linger a few
+        # seconds), so without this, re-entering Lichess mode would leave the OLD
+        # event-stream thread alive alongside the NEW one — a DUPLICATE
+        # event-stream connection for this account, which is itself a cause of
+        # the instant-at-creation abort (two game-stream connections conflict).
+        self._stop_lichess_if_running()
         self.reset_game()
         self.lichess_game = None
         self.pending_challenge = None
@@ -248,6 +586,14 @@ class ChessGUI:
         self.lichess_connected = False
         self.lichess_last_event_ticks = pygame.time.get_ticks()
         self.mode = "lichess"
+        # Auto-match settings from env (GUI can override at runtime).
+        self.lichess_opponent = os.environ.get("LICHESS_OPPONENT", "").strip()
+        self.lichess_auto = _parse_bool_env("LICHESS_AUTO_MATCH")
+        self.lichess_clock_limit_s = _parse_int_env("LICHESS_CLOCK_LIMIT", 300)
+        self.lichess_clock_increment_s = _parse_int_env("LICHESS_CLOCK_INCREMENT", 3)
+        self.lichess_opponent_field = TextInput(
+            self.small_font, (BOARD_SIZE + 10, 148, 200, 24))
+        self.lichess_opponent_field.set(self.lichess_opponent)
         token = self._get_lichess_token()
         if not token:
             self.lichess_controller = None
@@ -256,7 +602,15 @@ class ChessGUI:
             return
         self.lichess_status = "Connecting..."
         self._log_lichess("Connecting to Lichess...")
-        self.lichess_controller = LichessController(token)
+        opponents = (self.lichess_opponent,) if self.lichess_opponent else ()
+        self.lichess_controller = LichessController(
+            token,
+            opponents=opponents,
+            auto_accept=self.lichess_auto,
+            auto_challenge=self.lichess_auto,
+            clock_limit_s=self.lichess_clock_limit_s,
+            clock_increment_s=self.lichess_clock_increment_s,
+        )
         self.lichess_controller.start()
 
     def _stop_lichess_if_running(self) -> None:
@@ -274,6 +628,9 @@ class ChessGUI:
             except queue.Empty:
                 break
             self._handle_lichess_event(event)
+        # Proactively flag a no-first-move stall before the abort lands (the
+        # abort message alone arrives too late to be actionable).
+        self._warn_if_opponent_stalled()
 
     def _handle_lichess_event(self, event) -> None:
         # Any event proves the stream is alive — record it for the indicator.
@@ -282,6 +639,31 @@ class ChessGUI:
             self.pending_challenge = event
             self.lichess_status = f"Challenge from {event.opponent} ({event.speed})"
             self._log_lichess(f"Challenge: {event.opponent} ({event.speed})")
+            if self.lichess_opponent_field is not None:
+                self.lichess_opponent_field.active = False
+        elif isinstance(event, ChallengeSent):
+            self.lichess_status = f"Challenged {event.opponent} — waiting for accept"
+            # Include Lichess's challenge id — proof we sent exactly ONE challenge
+            # (one unique id logged once). If the opponent then logs receiving it
+            # twice, the duplication is on THEIR side (two event streams), not ours.
+            cid = f", id={event.challenge_id}" if event.challenge_id else ""
+            # Log the speed Lichess actually assigned. If we asked for a clock
+            # but Lichess reports "correspondence", the clock params didn't land
+            # (Lichess reads them from the POST body, not the query string) —
+            # warn loudly so it's not silently a no-clock game.
+            if event.speed == "correspondence":
+                self._log_lichess(
+                    f"Challenged {event.opponent}{cid} — WARNING: Lichess made this "
+                    "a correspondence (no-clock) game; the clock was not received. "
+                    "A streaming bot cannot safely play correspondence.")
+            elif event.speed and event.clock:
+                self._log_lichess(
+                    f"Challenged {event.opponent} ({event.speed} {event.clock}{cid})")
+            elif event.speed:
+                self._log_lichess(
+                    f"Challenged {event.opponent} ({event.speed}{cid})")
+            else:
+                self._log_lichess(f"Challenged {event.opponent}{cid}")
         elif isinstance(event, GameStarted):
             self.lichess_game = {
                 "game_id": event.game_id,
@@ -294,15 +676,35 @@ class ChessGUI:
                 "status": "started",
                 "winner": None,
                 "over": False,
+                # ms-since-pygame-init when the game started, used to detect a
+                # no-first-move stall and time the abort-diagnostic message.
+                "started_ticks": pygame.time.get_ticks(),
+                "no_first_move_warned": False,
+                # True once we begin thinking for this game ("Engine thinking..."
+                # Status or an EngineMoved). Lets _log_abort_diagnostic tell an
+                # instant-at-creation abort apart from an abort during our think.
+                "engine_started": False,
             }
             self.pending_challenge = None
             self.flipped = not event.bot_is_white  # show the bot's perspective
             self.review_mode = False
+            if self.lichess_opponent_field is not None:
+                self.lichess_opponent_field.active = False
             self.review_index = 0
             self.lichess_connected = True
             self.lichess_last_move_text = ""
             self.lichess_status = f"Playing {event.opponent_name}"
-            self._log_lichess(f"Game started vs {event.opponent_name}")
+            color = "White" if event.bot_is_white else "Black"
+            opp_color = "Black" if event.bot_is_white else "White"
+            self._log_lichess(
+                f"Game started vs {event.opponent_name} "
+                f"(you are {color}; {event.opponent_name} is {opp_color}; "
+                f"id={event.game_id})")
+            if not event.bot_is_white:
+                # We're Black — we cannot move until the opponent (White) does.
+                # Logged so an abort here is clearly the opponent's doing, not a
+                # freeze on our side.
+                self._log_lichess(f"Waiting for {event.opponent_name} (White) to move first")
             self._set_lichess_position(self.lichess_game["moves"])
         elif isinstance(event, GameUpdated):
             if self.lichess_game and self.lichess_game["game_id"] == event.game_id:
@@ -316,6 +718,8 @@ class ChessGUI:
                 if over:
                     self.lichess_status = self._lichess_result_text(event.status, event.winner)
                     self._log_lichess(f"Game over: {self.lichess_status}")
+                    if event.status in ABORT_LIKE_STATUSES:
+                        self._log_abort_diagnostic()
                     self._enter_review()
                 else:
                     self.lichess_status = f"Playing {self.lichess_game['opponent_name']}"
@@ -329,9 +733,13 @@ class ChessGUI:
                 # Optimistically show the engine's move; the next GameUpdated
                 # reconciles from the authoritative server move list.
                 self.lichess_game["moves"].append(event.uci)
+                self.lichess_game["engine_started"] = True
                 self._set_lichess_position(self.lichess_game["moves"])
                 self.lichess_status = f"Engine played {event.uci}"
                 self.lichess_last_move_text = f"Move {len(self.lichess_game['moves'])}: {event.uci}"
+                # Logged so the activity log proves WE moved (an abort after this
+                # is the opponent's doing, not ours).
+                self._log_lichess(f"Engine played {event.uci}")
         elif isinstance(event, GameFinished):
             if self.lichess_game and self.lichess_game["game_id"] == event.game_id:
                 self.lichess_game["moves"] = list(event.moves)
@@ -340,19 +748,33 @@ class ChessGUI:
                 self.lichess_game["over"] = True
                 self.lichess_status = self._lichess_result_text(event.status, event.winner)
                 self._log_lichess(f"Game over: {self.lichess_status}")
+                if event.status in ABORT_LIKE_STATUSES:
+                    self._log_abort_diagnostic()
                 self._enter_review()
             elif self.lichess_game is None:
                 self.lichess_status = f"Game {event.game_id} finished"
                 self._log_lichess(f"Game {event.game_id} finished")
         elif isinstance(event, Status):
-            # "Connected as ..." is meaningful (log it + show instructions);
-            # "Engine thinking..." is transient (just display it, don't log).
+            # "Connected as ..." marks the connection; "Engine thinking..." (a
+            # real think) and "Playing opening book ..." (an instant book move 1)
+            # mark the start of each of our moves. All are logged so the activity
+            # log proves we were working — e.g. an abort that arrives while one of
+            # those is the last entry (with no "Engine played" after it) is an
+            # opponent-side abort during our move, not a freeze.
             if event.message.startswith("Connected as"):
                 self.lichess_connected = True
                 self.lichess_status = f"{event.message} — waiting for challenges"
-                self._log_lichess(event.message)
             else:
                 self.lichess_status = event.message
+            # "Engine thinking..." (a real think) and "Playing opening book ..."
+            # (an instant book move 1 — Experiment A, no engine think) both prove
+            # the game thread reached _maybe_move — i.e. the gameFull was LIVE
+            # (not already aborted). Its absence is the signature of an instant
+            # abort at game creation.
+            if self.lichess_game and event.message.startswith(
+                    ("Engine thinking", "Playing opening book")):
+                self.lichess_game["engine_started"] = True
+            self._log_lichess(event.message)
         elif isinstance(event, Error):
             self.lichess_status = f"Error: {event.message}"
             self._log_lichess(f"Error: {event.message}")
@@ -429,13 +851,121 @@ class ChessGUI:
 
     def _abort_lichess(self) -> None:
         if self.lichess_game and self.lichess_controller and not self.lichess_game["over"]:
-            self.lichess_controller.abort(self.lichess_game["game_id"])
+            # Log the click so a manual abort is visible in the activity log —
+            # otherwise it's indistinguishable from a server-side conflict abort
+            # (the controller's abort() pushes no Status), and the abort
+            # diagnostic would misattribute it to a duplicate connection.
+            gid = self.lichess_game["game_id"]
+            self._log_lichess(f"Abort requested for game {gid} (manual button click)")
+            self.lichess_controller.abort(gid)
+
+    def _commit_opponent(self) -> None:
+        """Sync the text field into GUI + controller opponent state."""
+        if self.lichess_opponent_field is not None:
+            self.lichess_opponent = self.lichess_opponent_field.value()
+        if self.lichess_controller is not None:
+            opponents = (self.lichess_opponent,) if self.lichess_opponent else ()
+            self.lichess_controller.set_opponents(opponents)
+
+    def _challenge_opponent(self) -> None:
+        """Manually challenge the username in the opponent field (one-shot)."""
+        self._commit_opponent()
+        if not self.lichess_opponent:
+            self.lichess_status = "Enter an opponent username first"
+            self._log_lichess("Enter an opponent username first")
+            return
+        if self.lichess_controller is None:
+            self.lichess_status = "Not connected — set LICHESS_BOT_TOKEN and retry"
+            self._log_lichess("Not connected; cannot challenge yet")
+            return
+        self.lichess_controller.challenge(self.lichess_opponent)
+        self.lichess_status = f"Challenged {self.lichess_opponent}..."
+        # The "Challenged <opp>" log line comes from the ChallengeSent event
+        # (drained from the controller queue in _handle_lichess_event), which is
+        # the single source — so we do NOT log here, to avoid a duplicate line.
+
+    def _toggle_lichess_auto(self) -> None:
+        """Toggle auto-match: auto-accept peers + periodic auto-challenge."""
+        self.lichess_auto = not self.lichess_auto
+        self._commit_opponent()
+        if self.lichess_controller is not None:
+            self.lichess_controller.set_auto(self.lichess_auto)
+        state = "ON" if self.lichess_auto else "OFF"
+        self.lichess_status = f"Auto-match {state}"
+        self._log_lichess(f"Auto-match {state}")
+
+    def _upgrade_lichess_bot(self) -> None:
+        """Upgrade the linked Lichess account to a Bot account (irreversible).
+
+        The bot-only game stream endpoint 400s for a normal account; this calls
+        the controller's one-shot upgrade, which re-fetches the profile so the
+        GUI can resume normal operation without a restart.
+        """
+        if self.lichess_controller is None:
+            self.lichess_status = "Not connected — cannot upgrade"
+            self._log_lichess("Not connected; cannot upgrade")
+            return
+        self.lichess_status = "Upgrading to Bot account..."
+        self._log_lichess("Upgrading to Bot account (irreversible)...")
+        self.lichess_controller.upgrade_account()
+
+    def _copy_lichess_log(self) -> None:
+        """Copy the full activity log to the clipboard for troubleshooting.
+
+        The on-screen log is truncated to 30 chars/line and shows only the last
+        6 entries; this copies the complete source list so the output is useful
+        when reporting an error. Falls back to writing a file if no clipboard
+        backend is available.
+        """
+        from src.clipboard_util import copy_to_clipboard
+
+        username = self.lichess_controller.username if self.lichess_controller else ""
+        header = f"@{username} — {self.lichess_status}" if username else self.lichess_status
+        body = list(self.lichess_log) if self.lichess_log else ["(no activity yet)"]
+        text = "\n".join([header, *body])
+
+        if copy_to_clipboard(text):
+            self.lichess_status = "Activity log copied to clipboard"
+            self._log_lichess("Copied activity log to clipboard")
+            return
+        # Clipboard unavailable — write a file the user can open and share.
+        try:
+            path = os.path.abspath("lichess_activity_log.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            self.lichess_status = f"Log saved to {path}"
+            self._log_lichess(f"Saved log to {path}")
+        except OSError as exc:
+            self.lichess_status = f"Could not copy log: {exc}"
+            self._log_lichess(f"Could not copy log: {exc}")
+
+    def _handle_lichess_field_click(self, pos: tuple[int, int]) -> None:
+        """Focus the opponent field on click-in; defocus on click-out.
+
+        Focus is allowed whenever there is no *active* game (no game yet, or the
+        last game is finished) and no incoming challenge pending — independent of
+        the connection state and of review mode. Reviewing a finished game and
+        typing a new opponent to challenge again are independent actions, so
+        review mode must not lock the field (otherwise, after a game ends, the
+        only way to challenge again was to leave Lichess via Menu).
+        """
+        if self.lichess_opponent_field is None:
+            return
+        field_open = ((self.lichess_game is None or self.lichess_game.get("over"))
+                      and self.pending_challenge is None)
+        if field_open:
+            self.lichess_opponent_field.handle_click(pos)
+        else:
+            self.lichess_opponent_field.active = False
 
     def _menu_from_lichess(self) -> None:
         self._stop_lichess_if_running()
         self.lichess_game = None
         self.pending_challenge = None
         self.review_mode = False
+        self.lichess_auto = False
+        if self.lichess_opponent_field is not None:
+            self.lichess_opponent_field.active = False
         self.mode = "menu"
 
     # --- Review mode navigation ------------------------------------------
@@ -743,23 +1273,65 @@ class ChessGUI:
             self.screen.blit(self.small_font.render(activity, True, (130, 130, 130)), (bx, y))
         y += 22
 
-        # Idle instructions: tell the user how to get a game.
-        if self.lichess_connected and self.lichess_game is None \
-                and self.pending_challenge is None and not self.review_mode:
+        # Opponent field + Challenge/Auto controls whenever there is no *active*
+        # game (none yet, or the last game finished) and no pending incoming
+        # challenge. The field is editable even before the connection completes
+        # and during review of a finished game, so the user can always type the
+        # opponent name — the box used to be hidden until ``Connected as``
+        # arrived and locked during review, which made challenging again after a
+        # game impossible without leaving Lichess via Menu.
+        field_open = ((self.lichess_game is None or self.lichess_game.get("over"))
+                      and self.pending_challenge is None)
+        if field_open:
             username = self.lichess_controller.username if self.lichess_controller else ""
-            for line in self._wrap_text(
-                    "Waiting for a challenge. From another Lichess account,"
-                    " challenge this bot:", 30):
-                self.screen.blit(self.small_font.render(line, True, (200, 180, 120)), (bx, y))
-                y += 18
-            if username:
-                self.screen.blit(self.small_font.render(f"lichess.org/@/{username}",
-                                                        True, (120, 200, 255)), (bx, y))
-                y += 18
+            is_bot = self.lichess_controller.is_bot if self.lichess_controller else True
+            if not is_bot and username:
+                # Normal account: bot-only endpoints will 400. Show a clear,
+                # actionable warning in place of the handle and an Upgrade
+                # button instead of Challenge/Auto (challenging is blocked until
+                # the account is upgraded).
+                self.screen.blit(self.small_font.render(
+                    f"@{username} is not a Bot account", True, (220, 150, 120)),
+                    (bx, 110))
+            elif username:
+                self.screen.blit(self.small_font.render(f"You are @{username}",
+                                                        True, (120, 200, 255)), (bx, 110))
+            elif not self.lichess_connected:
+                for i, line in enumerate(self._wrap_text(
+                        "Not connected. Set LICHESS_BOT_TOKEN and restart.", 30)[:2]):
+                    self.screen.blit(self.small_font.render(line, True, (200, 180, 120)),
+                                     (bx, 100 + i * 16))
+            self.screen.blit(self.small_font.render("Opponent:", True, (200, 180, 120)),
+                             (bx, 130))
+            if self.lichess_opponent_field is not None:
+                self.lichess_opponent_field.draw(self.screen)
+            if not is_bot:
+                self._draw_button("Upgrade to Bot", bx, 176, 200, 26,
+                                  self._upgrade_lichess_bot)
+            else:
+                self._draw_button("Challenge", bx, 176, 95, 26, self._challenge_opponent)
+                auto_label = "Auto: ON" if self.lichess_auto else "Auto: OFF"
+                self._draw_button(auto_label, bx + 100, 176, 100, 26,
+                                  self._toggle_lichess_auto)
+            tc = f"{self.lichess_clock_limit_s // 60}+{self.lichess_clock_increment_s}"
+            self.screen.blit(self.small_font.render(f"Time control: {tc}",
+                                                    True, (130, 130, 130)), (bx, 206))
+            y = 228
+        else:
+            if not self.lichess_connected:
+                for line in self._wrap_text(
+                        "Not connected. Set LICHESS_BOT_TOKEN and restart.", 30):
+                    self.screen.blit(self.small_font.render(line, True, (200, 180, 120)),
+                                     (bx, y))
+                    y += 18
             y += 4
 
         # Activity log — what's going on (connected / challenge / game / over).
         self.screen.blit(self.medium_font.render("Activity:", True, TEXT_COLOR), (bx, y))
+        # Copy control next to the header. The on-screen lines are truncated to
+        # 30 chars, so this copies the full source log to the clipboard (with a
+        # file fallback) — useful for pasting into a bug report.
+        self._draw_button("Copy Log", bx + 78, y - 2, 86, 20, self._copy_lichess_log)
         y += 20
         for line in self.lichess_log[-6:]:
             if y > WINDOW_HEIGHT - 200:
@@ -969,10 +1541,17 @@ class ChessGUI:
                         else:
                             # Check buttons first (covers lichess panel buttons)
                             self.handle_button_click(event.pos)
-                            if self.mode == "play":
+                            if self.mode == "lichess":
+                                self._handle_lichess_field_click(event.pos)
+                            elif self.mode == "play":
                                 self.handle_click(event.pos)
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_n:
+                    if self.mode == "lichess" and self.lichess_opponent_field is not None \
+                            and self.lichess_opponent_field.active:
+                        # Typing in the opponent field — consume the key here so
+                        # global shortcuts (e.g. N = new game) do not fire.
+                        self.lichess_opponent_field.handle_key(event)
+                    elif event.key == pygame.K_n:
                         self._stop_lichess_if_running()
                         self.reset_game()
                         self.mode = "menu"
