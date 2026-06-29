@@ -10,7 +10,9 @@ a = Analysis(
     datas=[
         ('src/fonts', 'fonts'),
     ],
-    hiddenimports=['src.board', 'src.moves', 'src.game', 'src.engine', 'src.gui'],
+    hiddenimports=['src.board', 'src.moves', 'src.game', 'src.engine',
+                   'src.gui', 'src.gui_textinput', 'src.clipboard_util',
+                   'src.uci', 'src.lichess_client', 'src.lichess_controller'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

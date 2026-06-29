@@ -336,3 +336,34 @@ def move_to_algebraic(board: Board, move: Move) -> str:
         notation += "x"
     notation += dest
     return notation
+
+
+def move_to_uci(move: Move) -> str:
+    """Convert an internal move to UCI notation (e.g. 'e2e4', 'e7e8q', 'e1g1').
+
+    Castling is encoded as the king's from-to square (the UCI standard for
+    non-Chess960), which matches how `_king_moves` emits castling and how
+    `GameState.make_move` detects it (king moving two files).
+    """
+    from_r, from_c, to_r, to_c, promo = move
+    uci = Board.square_to_algebraic(from_r, from_c) + Board.square_to_algebraic(to_r, to_c)
+    if promo is not None:
+        uci += promo.lower()
+    return uci
+
+
+def uci_to_move(uci: str) -> Move:
+    """Convert UCI notation to an internal move.
+
+    Only from/to/promotion are encoded here; castling, en passant, and
+    promotion are inferred by `GameState.make_move` from the piece type and
+    the from/to squares. The special UCI move '0000' (no move) is rejected.
+    """
+    uci = uci.strip()
+    if uci in ("0000", ""):
+        raise ValueError(f"Cannot convert null/empty UCI move: {uci!r}")
+    from_sq, to_sq = uci[0:2], uci[2:4]
+    from_r, from_c = Board.algebraic_to_square(from_sq)
+    to_r, to_c = Board.algebraic_to_square(to_sq)
+    promo = uci[4].upper() if len(uci) > 4 else None
+    return (from_r, from_c, to_r, to_c, promo)

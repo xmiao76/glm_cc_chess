@@ -378,3 +378,26 @@ class ChessEngine:
                 if beta <= alpha:
                     break
             return beta
+
+
+def choose_move(board: Board, time_limit_ms: int | None = None,
+                max_depth: int | None = None) -> Move | None:
+    """Clean AI move-selection interface for UCI and Lichess integrations.
+
+    Guarantees:
+      * input is a valid chess position (caller-supplied `Board`);
+      * the returned move is legal for `board.active_color`, or `None` when the
+        game is already over (no legal moves);
+      * when `time_limit_ms` is provided the search respects it (best effort).
+
+    `max_depth` overrides the iterative-deepening ceiling (used by `go depth N`).
+    If both are `None`, engine defaults (depth 4, 2.0s) are used.
+
+    A fresh `ChessEngine` is constructed per call so search scratch state
+    (killer moves, history, timers) never leaks between moves — this makes the
+    function safe to call from UCI and Lichess worker threads.
+    """
+    depth = 20 if max_depth is None else max_depth
+    time_limit = (time_limit_ms / 1000.0) if time_limit_ms is not None else 2.0
+    engine = ChessEngine(max_depth=depth, time_limit=time_limit)
+    return engine.get_best_move(board, time_limit=time_limit)
