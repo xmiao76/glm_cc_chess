@@ -19,6 +19,7 @@ from src.engine import ChessEngine, choose_move
 from src.lichess_controller import (
     LichessController, ChallengeReceived, ChallengeSent, ChallengeDeclined,
     GameStarted, GameUpdated, EngineMoved, GameFinished, Status, Error,
+    AccountInfo,
 )
 from src.gui_textinput import TextInput, CAPTURE_VERSION
 from src.clipboard_util import paste_from_clipboard
@@ -99,8 +100,12 @@ def _build_identity() -> str:
 # Constants
 SQUARE_SIZE = 80
 BOARD_SIZE = SQUARE_SIZE * 8
-PANEL_WIDTH = 220
-WINDOW_WIDTH = BOARD_SIZE + PANEL_WIDTH
+# The side panel is resizable: the window can be widened to enlarge the panel
+# so the full activity-log text is visible (lines used to be truncated to 30
+# chars and clipped by the fixed 220px panel). The board stays 640x640 at the
+# top-left; only the width is flexible, and extra width flows into the panel.
+MIN_PANEL_WIDTH = 260
+DEFAULT_PANEL_WIDTH = 380
 # Characters allowed in a Lichess BOT token. The lichess-org/api OpenAPI spec
 # defines access tokens as ``^[A-Za-z0-9_]+$`` (alphanumeric + underscore only --
 # NO hyphen; the older 40-char form and the newer ``lip_...`` form both match).
@@ -165,7 +170,15 @@ class ChessGUI:
 
     def __init__(self) -> None:
         pygame.init()
-        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+        # Resizable window: the board is fixed at 640x640 in the top-left, and
+        # the side panel absorbs any extra width so the user can enlarge it to
+        # read the full (wrapped) panel text. The height is held at BOARD_SIZE
+        # (see _handle_resize) so the board is always fully visible -- only the
+        # panel width is flexible.
+        self.panel_width = DEFAULT_PANEL_WIDTH
+        self.window_width = BOARD_SIZE + self.panel_width
+        self.screen = pygame.display.set_mode(
+            (self.window_width, WINDOW_HEIGHT), pygame.RESIZABLE)
         pygame.display.set_caption("GLM CC Chess")
         self.clock = pygame.time.Clock()
 
@@ -208,6 +221,11 @@ class ChessGUI:
         self.lichess_last_event_ticks = 0  # pygame ticks of last received event
         self.lichess_last_move_text = ""  # e.g. "Move 12: e2e4"
         self.lichess_connected = False
+        # Connected-account display ("the Lichess score"): account name + per-speed
+        # ratings, pushed by the controller on connect and after each finished game.
+        self.lichess_account_name = ""
+        self.lichess_ratings: dict[str, int] = {}
+        self.lichess_last_speed = ""  # speed of the current/last game (for the header)
         # Challenge initiation + auto-match UI state
         self.lichess_opponent = ""  # committed opponent username
         self.lichess_auto = False  # auto-match (challenge + accept) toggle
@@ -308,6 +326,50 @@ class ChessGUI:
             return "--:--"
         secs = int(ms) // 1000
         return f"{secs // 60}:{secs % 60:02d}"
+
+    def _lichess_speed_for_clock(self) -> str:
+        """Best-guess Lichess speed for the configured clock (for the pre-game
+        header, before any game sets ``lichess_last_speed``).
+
+        Mirrors Lichess's own classification by estimated game duration
+        (``limit + increment*40`` seconds): <30 ultraBullet, <180 bullet, <480
+        blitz, <1500 rapid, else classical. So the default 5+3 (300+120=420s) is
+        blitz, 10+0 is rapid, 3+2 is blitz, 1+0 is bullet.
+        """
+        limit = self.lichess_clock_limit_s or 0
+        inc = self.lichess_clock_increment_s or 0
+        if not limit:
+            return "rapid"  # correspondence has no clock (we decline it anyway)
+        est = limit + inc * 40
+        if est < 30:
+            return "ultraBullet"
+        if est < 180:
+            return "bullet"
+        if est < 480:
+            return "blitz"
+        if est < 1500:
+            return "rapid"
+        return "classical"
+
+    def _lichess_rating_text(self) -> str:
+        """Compact "<speed> <rating>" for the header, or '' if no ratings yet.
+
+        Prefers the rating for the speed actually being played (the one that
+        refreshes after each game); falls back to the configured clock's speed,
+        then to any available rating. Empty before connect / if the account has
+        no games.
+        """
+        ratings = self.lichess_ratings or {}
+        if not ratings:
+            return ""
+        speed = (self.lichess_last_speed
+                 or self._lichess_speed_for_clock() or "")
+        if speed and speed in ratings:
+            return f"{speed} {ratings[speed]}"
+        for s in ("rapid", "blitz", "classical", "bullet"):
+            if s in ratings:
+                return f"{s} {ratings[s]}"
+        return ""
 
     def _lichess_result_text(self, status: str, winner) -> str:
         """Map a Lichess game-end status to a human-readable result."""
@@ -662,6 +724,44 @@ class ChessGUI:
             lines.append(current)
         return lines or [""]
 
+    @staticmethod
+    def _wrap_text_px(text: str, font: pygame.font.Font, max_px: int) -> list[str]:
+        """Greedy word-wrap so each line's pixel width is ``<= max_px``.
+
+        Unlike :meth:`_wrap_text` (char-count based), this measures with the
+        actual font, so it wraps correctly at any panel width -- the activity
+        log uses it so widening the window reveals the whole message that the
+        fixed 220px panel used to clip. A single word wider than ``max_px``
+        (a long URL or token fingerprint) is hard-broken char by char so it
+        still wraps instead of overflowing the panel.
+        """
+        words = (text or "").split()
+        lines: list[str] = []
+        cur = ""
+        for word in words:
+            candidate = f"{cur} {word}" if cur else word
+            if font.size(candidate)[0] <= max_px:
+                cur = candidate
+                continue
+            if cur:
+                lines.append(cur)
+                cur = ""
+            if font.size(word)[0] <= max_px:
+                cur = word
+            else:
+                chunk = ""
+                for ch in word:
+                    if font.size(chunk + ch)[0] <= max_px:
+                        chunk += ch
+                    else:
+                        if chunk:
+                            lines.append(chunk)
+                        chunk = ch
+                cur = chunk
+        if cur:
+            lines.append(cur)
+        return lines or [""]
+
     def _start_lichess(self) -> None:
         """Enter Lichess mode: reset state, build the input fields, connect if a
         token is already known.
@@ -686,6 +786,9 @@ class ChessGUI:
         self.lichess_log = []
         self.lichess_last_move_text = ""
         self.lichess_connected = False
+        self.lichess_account_name = ""
+        self.lichess_ratings = {}
+        self.lichess_last_speed = ""
         self.lichess_last_event_ticks = pygame.time.get_ticks()
         self.mode = "lichess"
         # Log which binary build this is so a copied activity log can confirm the
@@ -703,15 +806,18 @@ class ChessGUI:
         # a supported bot mode — so this is a knob + a logged signal, not a fix.
         self.lichess_rated = _parse_bool_env("LICHESS_RATED")
         self.lichess_opponent_field = TextInput(
-            self.small_font, (BOARD_SIZE + 10, 148, 200, 24))
+            self.small_font, (BOARD_SIZE + 10, 148, self.panel_width - 20, 24))
         self.lichess_opponent_field.set(self.lichess_opponent)
         # Masked token field — entered in the UI when no token is preconfigured.
         self.lichess_token_field = TextInput(
-            self.small_font, (BOARD_SIZE + 10, 140, 200, 24),
+            self.small_font, (BOARD_SIZE + 10, 140, self.panel_width - 20, 24),
             max_len=_LICHESS_TOKEN_MAX_LEN,
             valid_chars=_LICHESS_TOKEN_CHARS,
             mask=True,
         )
+        # Keep the fields in sync with the current panel width (matters if the
+        # window was resized before entering Lichess mode).
+        self._layout_lichess_fields()
         token = self._get_lichess_token()
         if token:
             # Prefill the masked field so the user sees a token is set, then
@@ -778,6 +884,38 @@ class ChessGUI:
         if self.lichess_controller is not None:
             self.lichess_controller.stop()
             self.lichess_controller = None
+
+    def _handle_resize(self, w: int, h: int) -> None:
+        """Grow the panel when the window is resized.
+
+        The board is fixed at 640x640 in the top-left; the height is held at
+        ``BOARD_SIZE`` so the board is always fully visible. Only the width is
+        flexible, and extra width flows into the side panel so the user can
+        enlarge it to read the full (wrapped) panel text. Called from the
+        ``VIDEORESIZE`` handler in :meth:`run`.
+        """
+        new_w = max(BOARD_SIZE + MIN_PANEL_WIDTH, w)
+        if new_w == self.window_width and h == WINDOW_HEIGHT:
+            return
+        self.window_width = new_w
+        self.panel_width = new_w - BOARD_SIZE
+        self.screen = pygame.display.set_mode(
+            (self.window_width, WINDOW_HEIGHT), pygame.RESIZABLE)
+        self._layout_lichess_fields()
+
+    def _layout_lichess_fields(self) -> None:
+        """Reposition the Lichess text fields to the current panel width.
+
+        The fields are created in :meth:`_start_lichess` at the current width;
+        this keeps them tracking the panel when the window is resized while
+        Lichess mode is active. No-op before the fields exist.
+        """
+        fw = max(120, self.panel_width - 20)
+        fx = BOARD_SIZE + 10
+        for field in (self.lichess_opponent_field, self.lichess_token_field):
+            if field is not None:
+                field.rect.x = fx
+                field.rect.w = fw
 
     def _drain_lichess_events(self) -> None:
         """Move queued controller events into GUI state (main thread only)."""
@@ -876,6 +1014,7 @@ class ChessGUI:
                 self.lichess_opponent_field.active = False
             self.review_index = 0
             self.lichess_connected = True
+            self.lichess_last_speed = event.speed  # header shows this speed's rating
             self.lichess_last_move_text = ""
             self.lichess_status = f"Playing {event.opponent_name}"
             color = "White" if event.bot_is_white else "Black"
@@ -950,6 +1089,25 @@ class ChessGUI:
             elif self.lichess_game is None:
                 self.lichess_status = f"Game {event.game_id} finished"
                 self._log_lichess(f"Game {event.game_id} finished")
+        elif isinstance(event, AccountInfo):
+            # The connected account's name + per-speed ratings ("the Lichess
+            # score"). Pushed on connect and after each finished game, so the
+            # header shows the account name and a rating that refreshes in real
+            # time as games complete. Marks us connected (belt-and-suspenders
+            # alongside the "Connected as ..." Status).
+            prev_ratings = self.lichess_ratings
+            self.lichess_account_name = event.username
+            self.lichess_ratings = dict(event.ratings)
+            self.lichess_connected = True
+            # Log a rating CHANGE after a game (not the initial connect), so the
+            # activity log shows the score updating in real time.
+            if prev_ratings and event.ratings:
+                changed = [(s, prev_ratings.get(s), event.ratings.get(s))
+                           for s in event.ratings
+                           if s in prev_ratings and prev_ratings.get(s) != event.ratings.get(s)]
+                if changed:
+                    parts = [f"{s}: {old}→{new}" for s, old, new in changed]
+                    self._log_lichess("Rating update: " + ", ".join(parts))
         elif isinstance(event, Status):
             # "Connected as ..." marks the connection; "Engine thinking..." (a
             # real think) and "Playing opening book ..." (an instant book move 1)
@@ -1470,7 +1628,7 @@ class ChessGUI:
             self._draw_lichess_panel()
             return
         panel_x = BOARD_SIZE
-        pygame.draw.rect(self.screen, PANEL_COLOR, (panel_x, 0, PANEL_WIDTH, WINDOW_HEIGHT))
+        pygame.draw.rect(self.screen, PANEL_COLOR, (panel_x, 0, self.panel_width, WINDOW_HEIGHT))
 
         # Title
         title = self.large_font.render("GLM CC Chess", True, (255, 255, 255))
@@ -1537,17 +1695,69 @@ class ChessGUI:
         and during a game the opponent, clocks, last move, and move history.
         """
         panel_x = BOARD_SIZE
-        pygame.draw.rect(self.screen, PANEL_COLOR, (panel_x, 0, PANEL_WIDTH, WINDOW_HEIGHT))
+        panel_w = self.panel_width
+        pygame.draw.rect(self.screen, PANEL_COLOR,
+                         (panel_x, 0, panel_w, WINDOW_HEIGHT))
         bx = panel_x + 10
+        inner_w = panel_w - 20             # text/content width
+        btn_full = inner_w                 # a full-width button
+        btn_half = (inner_w - 5) // 2      # two buttons per row with a 5px gap
 
         title = self.large_font.render("vs Lichess", True, (255, 255, 255))
         self.screen.blit(title, (bx, 10))
 
         y = 44
-        # Status (wrapped to up to 2 lines)
-        for line in self._wrap_text(self.lichess_status, 30)[:2]:
-            self.screen.blit(self.small_font.render(line, True, TEXT_COLOR), (bx, y))
+        # Account name + ratings header ("the Lichess score"). Always visible
+        # once connected (incl. during a game and during review). "@name" is the
+        # connected account; the per-speed ratings follow. The controller pushes
+        # an AccountInfo on connect and re-pushes after each finished game, so
+        # the rating refreshes in real time as games complete. The current/last
+        # game's speed is shown first and bright (the one that refreshes); the
+        # other speeds follow dimmed, wrapped across lines so a wider panel
+        # shows them all and a narrow panel still shows them (wrapped, never
+        # clipped — the fixed 220px panel used to clip the rating off the edge).
+        if self.lichess_connected:
+            name = (self.lichess_account_name
+                    or (self.lichess_controller.username
+                        if self.lichess_controller else ""))
+            self.screen.blit(self.small_font.render(f"@{name}", True, (120, 200, 255)),
+                             (bx, y))
             y += 18
+            ratings = self.lichess_ratings or {}
+            if ratings:
+                cur = (self.lichess_last_speed
+                       or self._lichess_speed_for_clock() or "")
+                order: list[str] = []
+                for s in (cur, "rapid", "blitz", "classical", "bullet"):
+                    if s and s in ratings and s not in order:
+                        order.append(s)
+                seg_x = bx
+                for i, s in enumerate(order):
+                    label = f"{s} {ratings[s]}"
+                    col = (170, 235, 170) if s == cur else (110, 150, 110)
+                    surf = self.small_font.render(label, True, col)
+                    if i > 0:
+                        sep_surf = self.small_font.render("·", True, (90, 90, 90))
+                        if seg_x + sep_surf.get_width() + surf.get_width() > bx + inner_w:
+                            seg_x = bx
+                            y += 16
+                        else:
+                            self.screen.blit(sep_surf, (seg_x, y))
+                            seg_x += sep_surf.get_width() + 4
+                    self.screen.blit(surf, (seg_x, y))
+                    seg_x += surf.get_width() + 4
+                y += 22
+            else:
+                y += 4
+        else:
+            y += 4
+
+        # Status (wrapped to the panel width, as many lines as needed -- the
+        # fixed-panel build truncated it to 2 lines of 30 chars).
+        for line in self._wrap_text_px(self.lichess_status, self.small_font, inner_w):
+            self.screen.blit(self.small_font.render(line, True, TEXT_COLOR), (bx, y))
+            y += 17
+        y += 3
 
         # Last-activity indicator — proves the connection is live. Updates on
         # every received event (including the ~7s Lichess keep-alive pulses).
@@ -1568,7 +1778,7 @@ class ChessGUI:
                                                     True, (200, 180, 120)), (bx, 100))
             if self.lichess_token_field is not None:
                 self.lichess_token_field.draw(self.screen, hint="paste token here")
-            self._draw_button("Connect", bx, 172, 200, 26, self._connect_with_token)
+            self._draw_button("Connect", bx, 172, btn_full, 26, self._connect_with_token)
             self.screen.blit(self.small_font.render("Ctrl+V paste, Enter to connect",
                                                     True, (110, 110, 110)), (bx, 202))
             y = 224
@@ -1587,54 +1797,79 @@ class ChessGUI:
                 is_bot = self.lichess_controller.is_bot if self.lichess_controller else True
                 if not is_bot and username:
                     # Normal account: bot-only endpoints will 400. Show a clear,
-                    # actionable warning in place of the handle and an Upgrade
-                    # button instead of Challenge/Auto (challenging is blocked
-                    # until the account is upgraded).
+                    # actionable warning (the account name itself is in the header
+                    # above) and an Upgrade button instead of Challenge/Auto
+                    # (challenging is blocked until the account is upgraded).
                     self.screen.blit(self.small_font.render(
                         f"@{username} is not a Bot account", True, (220, 150, 120)),
                         (bx, 110))
-                elif username:
-                    self.screen.blit(self.small_font.render(f"You are @{username}",
-                                                            True, (120, 200, 255)), (bx, 110))
                 self.screen.blit(self.small_font.render("Opponent:", True, (200, 180, 120)),
                                  (bx, 130))
                 if self.lichess_opponent_field is not None:
                     self.lichess_opponent_field.draw(self.screen)
                 if not is_bot:
-                    self._draw_button("Upgrade to Bot", bx, 176, 200, 26,
+                    self._draw_button("Upgrade to Bot", bx, 176, btn_full, 26,
                                       self._upgrade_lichess_bot)
                 else:
-                    self._draw_button("Challenge", bx, 176, 95, 26, self._challenge_opponent)
+                    self._draw_button("Challenge", bx, 176, btn_half, 26,
+                                      self._challenge_opponent)
                     auto_label = "Auto: ON" if self.lichess_auto else "Auto: OFF"
-                    self._draw_button(auto_label, bx + 100, 176, 100, 26,
+                    self._draw_button(auto_label, bx + btn_half + 5, 176, btn_half, 26,
                                       self._toggle_lichess_auto)
                 tc = f"{self.lichess_clock_limit_s // 60}+{self.lichess_clock_increment_s}"
                 rated_label = "Rated: ON" if self.lichess_rated else "Rated: OFF"
-                self._draw_button(rated_label, bx, 206, 95, 22, self._toggle_lichess_rated)
+                self._draw_button(rated_label, bx, 206, btn_half, 22, self._toggle_lichess_rated)
                 self.screen.blit(self.small_font.render(f"Time: {tc}",
-                                                        True, (130, 130, 130)), (bx + 100, 210))
+                                                        True, (130, 130, 130)),
+                                 (bx + btn_half + 9, 210))
                 y = 228
             else:
                 y += 4
 
         # Activity log — what's going on (connected / challenge / game / over).
         self.screen.blit(self.medium_font.render("Activity:", True, TEXT_COLOR), (bx, y))
-        # Copy control next to the header. The on-screen lines are truncated to
-        # 30 chars, so this copies the full source log to the clipboard (with a
-        # file fallback) — useful for pasting into a bug report.
+        # Copy control next to the header. The on-screen lines wrap to the panel
+        # width (no longer truncated to 30 chars), so this still copies the full
+        # source log to the clipboard (with a file fallback) for a bug report.
         self._draw_button("Copy Log", bx + 78, y - 2, 86, 20, self._copy_lichess_log)
         y += 20
-        for line in self.lichess_log[-6:]:
-            if y > WINDOW_HEIGHT - 200:
+        # How far down the log may flow before yielding to the block below it
+        # (the game block, or the Accept/Decline / Menu buttons).
+        if self.lichess_game:
+            log_bottom = WINDOW_HEIGHT - 196
+        elif self.pending_challenge is not None:
+            log_bottom = WINDOW_HEIGHT - 112
+        else:
+            log_bottom = WINDOW_HEIGHT - 44
+        line_h = 16
+        max_lines = max(0, (log_bottom - y) // line_h)
+        # Gather wrapped lines from the most recent entries until they fill the
+        # space (newest ends at the bottom, as before). Wrapping means a wider
+        # panel shows more entries -- each on fewer lines -- so the user widens
+        # the window to see more of the message that used to be clipped.
+        chosen: list[list[str]] = []
+        count = 0
+        for entry in reversed(self.lichess_log):
+            wrapped = self._wrap_text_px(entry, self.small_font, inner_w)
+            if chosen and count + len(wrapped) > max_lines:
                 break
-            self.screen.blit(self.small_font.render(line[:30], True, (170, 170, 170)), (bx, y))
-            y += 17
+            chosen.append(wrapped)
+            count += len(wrapped)
+        chosen.reverse()  # oldest-of-the-shown first; newest at the bottom
+        for grp in chosen:
+            for ln in grp:
+                self.screen.blit(self.small_font.render(ln, True, (170, 170, 170)),
+                                 (bx, y))
+                y += line_h
 
         # Game block (active game or review): opponent, clocks, last move, moves.
         if self.lichess_game:
             y = WINDOW_HEIGHT - 190
             opp = str(self.lichess_game.get("opponent_name", "?"))
-            self.screen.blit(self.small_font.render(f"Opp: {opp[:20]}", True, TEXT_COLOR), (bx, y))
+            opp_y = y
+            for line in self._wrap_text_px(f"Opp: {opp}", self.small_font, inner_w)[:2]:
+                self.screen.blit(self.small_font.render(line, True, TEXT_COLOR), (bx, opp_y))
+                opp_y += 16
             y += 20
             wclk = self._fmt_clock(self.lichess_game.get("wtime"))
             bclk = self._fmt_clock(self.lichess_game.get("btime"))
@@ -1645,26 +1880,31 @@ class ChessGUI:
                              (bx, y))
             y += 18
             if self.lichess_last_move_text:
-                self.screen.blit(self.small_font.render(self.lichess_last_move_text[:28],
-                                                        True, (180, 180, 180)), (bx, y))
-                y += 18
+                for line in self._wrap_text_px(self.lichess_last_move_text,
+                                               self.small_font, inner_w)[:2]:
+                    self.screen.blit(self.small_font.render(line, True, (180, 180, 180)),
+                                     (bx, y))
+                    y += 16
             self.screen.blit(self.small_font.render("Moves:", True, TEXT_COLOR), (bx, y))
             y += 18
             for notation in self.move_history[-6:]:
                 if y > WINDOW_HEIGHT - 116:
                     break
-                self.screen.blit(self.small_font.render(notation[:24], True, (170, 170, 170)),
+                self.screen.blit(self.small_font.render(notation, True, (170, 170, 170)),
                                  (bx, y))
                 y += 16
 
         # Buttons — re-registered every frame (GUI_BUTTON_PATTERN)
         if self.pending_challenge is not None:
-            self._draw_button("Accept", bx, WINDOW_HEIGHT - 104, 95, 28, self._accept_challenge)
-            self._draw_button("Decline", bx + 100, WINDOW_HEIGHT - 104, 95, 28,
+            self._draw_button("Accept", bx, WINDOW_HEIGHT - 104, btn_half, 28,
+                              self._accept_challenge)
+            self._draw_button("Decline", bx + btn_half + 5, WINDOW_HEIGHT - 104, btn_half, 28,
                               self._decline_challenge)
         elif self.lichess_game and not self.lichess_game.get("over") and not self.review_mode:
-            self._draw_button("Resign", bx, WINDOW_HEIGHT - 104, 95, 28, self._resign_lichess)
-            self._draw_button("Abort", bx + 100, WINDOW_HEIGHT - 104, 95, 28, self._abort_lichess)
+            self._draw_button("Resign", bx, WINDOW_HEIGHT - 104, btn_half, 28,
+                              self._resign_lichess)
+            self._draw_button("Abort", bx + btn_half + 5, WINDOW_HEIGHT - 104, btn_half, 28,
+                              self._abort_lichess)
 
         if self.review_mode:
             self._draw_button("<<", bx, WINDOW_HEIGHT - 70, 45, 28, self._review_home)
@@ -1672,7 +1912,7 @@ class ChessGUI:
             self._draw_button(">", bx + 100, WINDOW_HEIGHT - 70, 45, 28, self._review_next)
             self._draw_button(">>", bx + 150, WINDOW_HEIGHT - 70, 45, 28, self._review_end)
 
-        self._draw_button("Menu", bx, WINDOW_HEIGHT - 36, 200, 28, self._menu_from_lichess)
+        self._draw_button("Menu", bx, WINDOW_HEIGHT - 36, btn_full, 28, self._menu_from_lichess)
 
     def _draw_promotion_dialog(self) -> None:
         """Draw promotion piece selection dialog."""
@@ -1694,7 +1934,7 @@ class ChessGUI:
         piece_types = ["Q", "R", "B", "N"]
 
         # Draw semi-transparent overlay
-        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay = pygame.Surface((self.window_width, WINDOW_HEIGHT), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 128))
         self.screen.blit(overlay, (0, 0))
 
@@ -1786,21 +2026,21 @@ class ChessGUI:
         self.screen.fill(BG_COLOR)
 
         title = self.large_font.render("GLM CC Chess", True, (255, 255, 255))
-        title_rect = title.get_rect(center=(WINDOW_WIDTH // 2, 100))
+        title_rect = title.get_rect(center=(self.window_width // 2, 100))
         self.screen.blit(title, title_rect)
 
         subtitle = self.medium_font.render("A Chess Game with Built-in Engine", True, (180, 180, 180))
-        sub_rect = subtitle.get_rect(center=(WINDOW_WIDTH // 2, 140))
+        sub_rect = subtitle.get_rect(center=(self.window_width // 2, 140))
         self.screen.blit(subtitle, sub_rect)
 
         self._buttons = []
-        self._draw_button("Play as White", WINDOW_WIDTH // 2 - 100, 200, 200, 40,
+        self._draw_button("Play as White", self.window_width // 2 - 100, 200, 200, 40,
                          lambda: self._start_game("w"))
-        self._draw_button("Play as Black", WINDOW_WIDTH // 2 - 100, 260, 200, 40,
+        self._draw_button("Play as Black", self.window_width // 2 - 100, 260, 200, 40,
                          lambda: self._start_game("b"))
-        self._draw_button("Engine vs Engine", WINDOW_WIDTH // 2 - 100, 320, 200, 40,
+        self._draw_button("Engine vs Engine", self.window_width // 2 - 100, 320, 200, 40,
                          lambda: self._start_game("engine_vs_engine"))
-        self._draw_button("AI vs Lichess", WINDOW_WIDTH // 2 - 100, 380, 200, 40,
+        self._draw_button("AI vs Lichess", self.window_width // 2 - 100, 380, 200, 40,
                          self._start_lichess)
 
     def _start_game(self, mode: str) -> None:
@@ -1822,6 +2062,11 @@ class ChessGUI:
                 if event.type == pygame.QUIT:
                     self._stop_lichess_if_running()
                     running = False
+                elif event.type == pygame.VIDEORESIZE:
+                    # Widen the panel (board stays 640x640; height held at
+                    # BOARD_SIZE). Lets the user enlarge the right side to read
+                    # the full panel text.
+                    self._handle_resize(event.w, event.h)
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:
                         if self.promotion_pending is not None:

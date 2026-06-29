@@ -30,6 +30,7 @@ from src.lichess_controller import (
     GameFinished,
     Status,
     Error,
+    AccountInfo,
     FIRST_MOVE_BUDGET_MS,
     _OPENING_BOOK_WHITE_MOVE1,
 )
@@ -77,9 +78,13 @@ class FakeTextResp(FakeResp):
 class FakeClient:
     """In-memory Lichess client for controller tests."""
 
-    def __init__(self, username="MyBot", title=None):
+    def __init__(self, username="MyBot", title=None, perfs=None):
         self.username = username
         self.title = title  # "BOT" for a bot account; None/other for a normal one
+        # Optional per-speed ratings ("the Lichess score"), e.g.
+        # {"rapid": {"rating": 1500, "games": 10}}. Mirrors the profile ``perfs``
+        # map; mutated between calls in tests that simulate a rating change.
+        self.perfs = dict(perfs) if perfs else {}
         self.posted_moves = []
         self.profile_called = False
         self.profile_calls = 0
@@ -98,6 +103,8 @@ class FakeClient:
         profile = {"username": self.username, "id": self.username.lower()}
         if self.title:
             profile["title"] = self.title
+        if self.perfs:
+            profile["perfs"] = self.perfs
         return profile
 
     def upgrade_to_bot(self):
@@ -3553,3 +3560,175 @@ class TestTokenFingerprint:
         assert "len=14" in fp
         assert "upper=0" in fp
         assert "prefix_lip=True" in fp
+
+
+# ---------------------------------------------------------------------------
+# Account name + per-speed ratings ("the Lichess score")
+# ---------------------------------------------------------------------------
+
+
+class TestAccountRatings:
+    """The connected account's name + ratings, surfaced on connect and refreshed
+    after each finished game (so the UI's score updates in real time)."""
+
+    PERFS = {"rapid": {"rating": 1500, "games": 10, "rd": 60, "prog": 0},
+             "blitz": {"rating": 1490, "games": 5},
+             # correspondence is a perf but NOT a surfaced real-time speed:
+             "correspondence": {"rating": 1600, "games": 1}}
+
+    def test_extract_ratings_keeps_realtime_speeds_as_ints(self):
+        out = LichessController._extract_ratings({"username": "B", "perfs": self.PERFS})
+        assert out == {"rapid": 1500, "blitz": 1490}
+        assert all(isinstance(v, int) for v in out.values())
+
+    def test_extract_ratings_tolerates_missing_perfs(self):
+        assert LichessController._extract_ratings({}) == {}
+        assert LichessController._extract_ratings({"username": "B"}) == {}
+        assert LichessController._extract_ratings({"perfs": "nope"}) == {}
+
+    def test_start_pushes_account_info_with_name_and_ratings(self):
+        fc = FakeClient("xmiao_glm", title="BOT", perfs=self.PERFS)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose,
+                                 singleton_bind=lambda name: True)
+        ctrl.start()
+        try:
+            out = drain(ctrl)
+        finally:
+            ctrl.stop()
+        infos = [e for e in out if isinstance(e, AccountInfo)]
+        assert len(infos) == 1
+        assert infos[0].username == "xmiao_glm"
+        assert infos[0].ratings == {"rapid": 1500, "blitz": 1490}
+
+    def test_finished_game_refreshes_ratings(self):
+        # After a real finish the controller re-fetches the profile and pushes a
+        # NEW AccountInfo with the updated rating. delay=0 makes the refresh
+        # immediate; the fake rating is bumped (simulating Lichess settling it)
+        # before the refresh reads it back.
+        fc = FakeClient("xmiao_glm", title="BOT",
+                        perfs={"rapid": {"rating": 1500}})
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose,
+                                 singleton_bind=lambda name: True,
+                                 rating_refresh_delay_s=0.0)
+        ctrl.start()                       # fetches 1500 -> AccountInfo(1500)
+        try:
+            drain(ctrl)                    # clear the connect events
+            fc.perfs = {"rapid": {"rating": 1515}}   # rating settled after game
+            game_full = {"id": "g", "white": {"name": "MyBot"},
+                         "black": {"name": "O"}, "speed": "rapid",
+                         "initialFen": "startpos",
+                         "state": {"moves": "", "wtime": 10000, "btime": 10000,
+                                   "winc": 0, "binc": 0, "status": "started"}}
+            mate = {"type": "gameState", "moves": "f2f3 e7e5 g2g4 d8h4",
+                    "wtime": 10000, "btime": 10000, "winc": 0, "binc": 0,
+                    "status": "mate", "winner": "black"}
+            ctrl._process_game_stream("g", iter([game_full, mate]))
+            deadline = time.monotonic() + 2.0
+            infos = []
+            while time.monotonic() < deadline:
+                try:
+                    e = ctrl.event_queue.get(timeout=0.05)
+                except queue.Empty:
+                    if infos:
+                        break
+                    continue
+                if isinstance(e, AccountInfo):
+                    infos.append(e)
+            assert any(i.ratings.get("rapid") == 1515 for i in infos), infos
+        finally:
+            ctrl.stop()
+
+    def test_aborted_game_does_not_refresh_ratings(self):
+        # An aborted/noStart game never changes a rating, so no re-fetch happens.
+        fc = FakeClient("xmiao_glm", title="BOT",
+                        perfs={"rapid": {"rating": 1500}})
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose,
+                                 singleton_bind=lambda name: True,
+                                 rating_refresh_delay_s=0.0)
+        ctrl._username = "xmiao_glm"
+        game_full = {"id": "g", "white": {"name": "MyBot"}, "black": {"name": "O"},
+                     "speed": "rapid", "initialFen": "startpos",
+                     "state": {"moves": "", "wtime": 0, "btime": 0, "winc": 0,
+                               "binc": 0, "status": "aborted"}}
+        calls_before = fc.profile_calls
+        ctrl._process_game_stream("g", iter([game_full]))
+        deadline = time.monotonic() + 0.4
+        refreshed = False
+        while time.monotonic() < deadline:
+            try:
+                e = ctrl.event_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if isinstance(e, AccountInfo):
+                refreshed = True
+        assert not refreshed
+        assert fc.profile_calls == calls_before   # no re-fetch for an abort
+        ctrl.stop()
+
+
+class TestLichessAccountHeader:
+    """GUI state + header text for the account name + rating display."""
+
+    def _make_gui(self, monkeypatch):
+        monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+        monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+        import pygame
+        pygame.init()
+        try:
+            pygame.display.set_mode((640, 480))
+            import src.gui as gui
+            g = gui.ChessGUI()
+            g.lichess_controller = _FakeLichessController()
+            return g, pygame
+        except Exception:
+            pygame.quit()
+            raise
+
+    def test_account_info_sets_name_ratings_and_connected(self, monkeypatch):
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            assert g.lichess_connected is False
+            g._handle_lichess_event(AccountInfo(
+                username="xmiao_glm", ratings={"rapid": 1500, "blitz": 1490}))
+            assert g.lichess_connected is True
+            assert g.lichess_account_name == "xmiao_glm"
+            assert g.lichess_ratings == {"rapid": 1500, "blitz": 1490}
+        finally:
+            pygame.quit()
+
+    def test_account_info_logs_a_rating_change_after_a_game(self, monkeypatch):
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g._handle_lichess_event(AccountInfo(username="b", ratings={"rapid": 1500}))
+            g.lichess_log.clear()
+            g._handle_lichess_event(AccountInfo(username="b", ratings={"rapid": 1515}))
+            assert any("rapid" in line and "1515" in line for line in g.lichess_log)
+        finally:
+            pygame.quit()
+
+    def test_rating_text_prefers_last_speed(self, monkeypatch):
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_ratings = {"rapid": 1500, "blitz": 1490}
+            g.lichess_last_speed = "blitz"
+            assert g._lichess_rating_text() == "blitz 1490"
+        finally:
+            pygame.quit()
+
+    def test_rating_text_falls_back_to_clock_speed(self, monkeypatch):
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_ratings = {"rapid": 1500, "blitz": 1490}
+            g.lichess_last_speed = ""      # before any game: use the clock's speed
+            # default clock 5+3 -> estimated 420s -> Lichess classifies it blitz
+            assert g._lichess_rating_text() == "blitz 1490"
+        finally:
+            pygame.quit()
+
+    def test_rating_text_empty_before_connect(self, monkeypatch):
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_ratings = {}
+            assert g._lichess_rating_text() == ""
+        finally:
+            pygame.quit()

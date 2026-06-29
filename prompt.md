@@ -21,6 +21,9 @@ The final application must be able to complete full chess games correctly
 The application must support an engine-versus-engine mode where the user can watch two engines play a full game against each other
 The application must support an "AI vs Lichess" mode in which the built-in engine plays real, timed games on Lichess.org against human or bot opponents
 In AI vs Lichess mode, the active game must be shown live on the board from the engine's perspective, with the opponent name and clocks, and the engine must move automatically on its turn
+The GUI side panel must be resizable: the user must be able to widen the window to enlarge the panel (the chessboard stays a fixed size and the extra width flows into the panel), and panel text — status, activity log, opponent, and move list — must wrap to the panel width instead of being truncated or clipped, so the whole message is visible at any panel width
+In AI vs Lichess mode, once connected, the UI must display both the connected account's name and its Lichess rating(s) (the Lichess score)
+The displayed Lichess rating must refresh in real time after each completed game by re-reading the account profile, without requiring a restart or a manual refresh
 After a Lichess game finishes, the user must be able to step through and review the entire game move by move
 The user must be able to manually challenge a specific opponent by username and to accept or decline incoming challenges shown in the UI
 An auto-match option must let the bot automatically play a chosen opponent, auto-accepting their challenges and re-issuing a challenge while idle, while keeping at most one game in progress at a time
@@ -77,6 +80,8 @@ Define completion so that the task is only finished when:
 - every game mode works: human-versus-engine, engine-versus-engine, and AI vs Lichess
 - the engine is drivable on its own through its UCI interface
 - Lichess games connect with a dedicated BOT account, display live on the board, and can be reviewed move by move when finished
+- the GUI side panel is resizable and its text wraps to the panel width, so the full message is visible at any panel size rather than truncated or clipped
+- in AI vs Lichess mode the connected account name and Lichess rating are shown together, and the rating refreshes in real time after each completed game
 - the Lichess token is handled securely — entered masked in the GUI or supplied via an environment variable, and never hardcoded, committed, logged, or written to a file
 - the Windows executable is successfully packaged into the release folder
 - the packaged release .exe is tested directly from the release folder

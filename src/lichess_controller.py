@@ -36,6 +36,15 @@ logger = logging.getLogger(__name__)
 
 # Lichess game statuses that mean the game is still in progress.
 ACTIVE_STATUSES = ("created", "started")
+# Game-end statuses that never change a rating (the game didn't get played), so
+# we skip the post-game rating refresh for them.
+ABORT_LIKE_STATUSES = ("aborted", "noStart")
+# Lichess per-speed ratings we surface as "the score" (the profile ``perfs`` map
+# has one entry per speed; these are the real-time speeds a bot plays).
+RATING_SPEEDS = ("bullet", "blitz", "rapid", "classical")
+# Delay before re-reading ratings after a finished game, so Lichess has settled
+# the new Glicko rating. Configurable (tests pass 0) via ``rating_refresh_delay_s``.
+RATING_REFRESH_DELAY_S = 1.5
 
 # How long an auto-accept "claim" holds before a gameStart must confirm it. Bounds
 # the window where a declined/expired accepted challenge could otherwise leave the
@@ -151,6 +160,9 @@ class GameStarted:
     moves: tuple[str, ...]
     wtime: Optional[int]
     btime: Optional[int]
+    # Lichess speed ("bullet"/"blitz"/"rapid"/"classical"/...). Lets the GUI show
+    # the rating for the speed actually being played (the one that refreshes).
+    speed: str = ""
 
 
 @dataclass(frozen=True)
@@ -188,6 +200,20 @@ class Error:
     message: str
 
 
+@dataclass(frozen=True)
+class AccountInfo:
+    """The connected account's username + per-speed ratings ("the Lichess score").
+
+    Pushed once on connect (right after the profile fetch) and again after each
+    finished game (re-fetched), so the GUI can show the account name and a
+    real-time rating that refreshes as games complete. ``ratings`` maps a Lichess
+    speed (``bullet``/``blitz``/``rapid``/``classical``) to its rating integer;
+    it is empty before connect or if the account has played no games.
+    """
+    username: str
+    ratings: dict = field(default_factory=dict)
+
+
 # Type alias for the engine move-selection function injected for testability.
 ChooseMoveFn = Callable[[Board, Optional[int]], Optional[Move]]
 
@@ -211,6 +237,7 @@ class LichessController:
         variant: str = "standard",
         color: str = "random",
         singleton_bind: Optional[Callable[[str], bool]] = None,
+        rating_refresh_delay_s: float = RATING_REFRESH_DELAY_S,
     ) -> None:
         self.client = client if client is not None else LichessClient(token)
         self.engine_choose = engine_choose
@@ -229,6 +256,12 @@ class LichessController:
         self.event_queue: queue.Queue[object] = queue.Queue()
         self._stop = threading.Event()
         self._username: str = ""
+        # Per-speed ratings ("the Lichess score"), refreshed after each finished
+        # game. Populated from the profile ``perfs`` map; empty until connect.
+        self._ratings: dict[str, int] = {}
+        # Delay before re-reading ratings after a finished game so Lichess has
+        # settled the new rating. Configurable so tests can pass 0.
+        self._rating_refresh_delay_s = float(rating_refresh_delay_s)
         # Whether the linked account is a Bot account (``title == "BOT"``). The
         # bot-only endpoints (game stream, make move) 400 for a normal account,
         # so challenges are blocked until this is True. Defaults True so a
@@ -273,6 +306,8 @@ class LichessController:
         # Detect that up front so we can block challenges and tell the user to
         # upgrade, rather than letting the first game stream fail cryptically.
         self._is_bot = (profile.get("title") == "BOT")
+        # Per-speed ratings ("the Lichess score") for the GUI header.
+        self._ratings = self._extract_ratings(profile)
         # Per-account singleton lock (xmiao_glm.md §3): prove we are the ONLY
         # process for this account. A second process double-connects the game
         # stream and aborts every game at creation. SOFT -- a failure is logged +
@@ -306,6 +341,9 @@ class LichessController:
         self._threads.append(thread)
         thread.start()
         self._ensure_challenge_thread()
+        # Surface the account name + ratings so the GUI header can render them
+        # immediately on connect (and again after each finished game).
+        self._push(AccountInfo(username=self._username, ratings=dict(self._ratings)))
 
     def upgrade_account(self) -> None:
         """Upgrade the linked account to a Bot account (IRREVERSIBLE).
@@ -323,9 +361,11 @@ class LichessController:
             profile = self.client.get_profile()
             self._username = profile.get("username", "") or profile.get("id", "")
             self._is_bot = (profile.get("title") == "BOT")
+            self._ratings = self._extract_ratings(profile)
         except LichessAPIError as exc:
             self._push(Error(f"upgrade sent but profile re-fetch failed: {exc}"))
             return
+        self._push(AccountInfo(username=self._username, ratings=dict(self._ratings)))
         if self._is_bot:
             self._push(Status(f"Upgraded to Bot account as {self._username}"))
             self._ensure_challenge_thread()
@@ -810,6 +850,7 @@ class LichessController:
                             opponent_name=opponent_name, initial_fen=initial_fen,
                             moves=self._moves_list(state),
                             wtime=state.get("wtime"), btime=state.get("btime"),
+                            speed=str(obj.get("speed", "") or ""),
                         ))
                         if self.is_game_over_status(state.get("status", "started")):
                             # The gameFull arrived already over: an instant abort at
@@ -905,13 +946,18 @@ class LichessController:
         with self._state_lock:
             self._active_games.discard(game_id)
             self._accepting = False
+        status = str(state.get("status", "finished"))
         self._push(GameFinished(
             game_id=game_id,
-            status=str(state.get("status", "finished")),
+            status=status,
             winner=state.get("winner"),
             moves=self._moves_list(state),
             initial_fen=initial_fen,
         ))
+        # Refresh the rating after a real game (a completed game can change it).
+        # Aborted/noStart games never affect rating, so skip the fetch for them.
+        if status not in ABORT_LIKE_STATUSES:
+            self._refresh_ratings()
 
     def _log_already_over_game_full(self, game_id: str, game_full: dict,
                                     state: dict) -> None:
@@ -1152,6 +1198,66 @@ class LichessController:
     @staticmethod
     def is_game_over_status(status: Optional[str]) -> bool:
         return status not in ACTIVE_STATUSES
+
+    @staticmethod
+    def _extract_ratings(profile: dict) -> dict[str, int]:
+        """Pull the per-speed ratings ("the Lichess score") out of a profile.
+
+        The Lichess profile carries a ``perfs`` map keyed by speed
+        (``bullet``/``blitz``/``rapid``/``classical``/...); each value has a
+        ``rating`` integer. Returns only the real-time speeds in
+        :data:`RATING_SPEEDS` that are present, as ``{speed: rating}`` (ints).
+        Tolerant of a missing/odd ``perfs`` (returns ``{}``).
+        """
+        perfs = profile.get("perfs") if isinstance(profile, dict) else None
+        if not isinstance(perfs, dict):
+            return {}
+        ratings: dict[str, int] = {}
+        for speed in RATING_SPEEDS:
+            perf = perfs.get(speed)
+            if isinstance(perf, dict):
+                rating = perf.get("rating")
+                if isinstance(rating, (int, float)):
+                    ratings[speed] = int(rating)
+        return ratings
+
+    def _refresh_ratings(self, delay_s: Optional[float] = None) -> None:
+        """Re-fetch the profile and push an :class:`AccountInfo` with new ratings.
+
+        Runs on a short-lived daemon thread so it never blocks the event/game
+        streams or the GUI. Called after a finished game so the GUI's rating
+        refreshes in real time; the delay gives Lichess a moment to finalize the
+        new Glicko rating before we read it back. Best-effort: a fetch failure is
+        logged and dropped (the GUI keeps the last-known rating).
+        """
+        if self._stop.is_set():
+            return
+        if delay_s is None:
+            delay_s = self._rating_refresh_delay_s
+
+        def _worker() -> None:
+            if delay_s > 0 and self._stop.wait(delay_s):
+                return  # stopped during the delay
+            try:
+                profile = self.client.get_profile()
+            except LichessAPIError as exc:
+                logger.debug("rating refresh failed: %s", exc)
+                return
+            if not isinstance(profile, dict):
+                return
+            self._username = (profile.get("username") or profile.get("id")
+                              or self._username)
+            self._ratings = self._extract_ratings(profile)
+            self._push(AccountInfo(username=self._username,
+                                   ratings=dict(self._ratings)))
+
+        # Drop finished threads so the list does not grow unbounded over many
+        # games (mirrors _start_game_thread).
+        self._threads = [t for t in self._threads if t.is_alive()]
+        thread = threading.Thread(target=_worker, daemon=True,
+                                  name="lichess-rating-refresh")
+        self._threads.append(thread)
+        thread.start()
 
     def _bot_is_white(self, game_full: dict) -> bool:
         white_name = str(game_full.get("white", {}).get("name", "")).lower()
