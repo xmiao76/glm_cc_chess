@@ -61,6 +61,13 @@ var first, then `lichess/config.yml`.
 > (used in `config.yml.example`) is rejected by the app, so an unedited copy is
 > never accidentally used as a token.
 
+> **You can also enter the token directly in the GUI** (no env var needed):
+> if no token is found, the Lichess panel shows a masked input box — paste/type
+> the token and click **Connect** (or press **Enter**; **Ctrl+V** pastes from the
+> clipboard). On Connect the app sets `LICHESS_BOT_TOKEN` for the session and
+> starts the controller. The token is masked (`*` per char), never logged, and
+> never written to a file.
+
 ## 3. Play from the GUI (primary)
 
 ```bash
@@ -69,8 +76,10 @@ python -m src.main
 (or double-click the packaged `GLM_CC_Chess.exe`)
 
 1. Click **"AI vs Lichess"** on the main menu.
-2. If no token is found, the panel shows instructions — set
-   `LICHESS_BOT_TOKEN` and restart.
+2. If a token is already set (env var or `config.yml`), the app connects
+   automatically. Otherwise the panel shows a **masked token input** — paste/type
+   your `bot:play` token and click **Connect** (or press **Enter**; **Ctrl+V**
+   pastes). The app sets `LICHESS_BOT_TOKEN` for the session from this input.
 3. Once connected, the app streams incoming challenges. When a challenge
    appears, click **Accept** or **Decline** in the side panel.
 4. The game is shown live on the board (from the bot's perspective) with
@@ -115,6 +124,18 @@ automatic (no typing):
 | `LICHESS_AUTO_MATCH` | `1`/`true` to enable auto-match on launch | off |
 | `LICHESS_CLOCK_LIMIT` | Clock initial time in seconds | `300` (5 min) |
 | `LICHESS_CLOCK_INCREMENT` | Increment per move in seconds | `3` |
+| `LICHESS_RATED` | `1`/`true` for **rated** challenges; off = **casual** | off (casual) |
+
+The rated/casual mode is shown in the activity log on every challenge, e.g.
+`Challenged beta (rapid 300+3, casual, id=...)` or `... (rapid 300+3, rated, ...)`,
+so you can confirm at a glance which mode you are sending. Casual is the default
+(preserves prior behavior); set `LICHESS_RATED=1` to send rated challenges. You
+can also flip it at runtime with the **"Rated: ON/OFF"** toggle button in the
+Lichess panel (next to the time-control text) — the next manual or auto challenge
+sends the new mode, no restart needed. The mode is one of the variables in the
+abort investigation — it is **not** an asserted fix (casual is a supported bot
+mode; whether rated changes the abort is unverified), but it is a configurable
+knob and a logged signal.
 
 Example — two bots, fully automatic from launch:
 

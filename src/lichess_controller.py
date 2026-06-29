@@ -15,10 +15,12 @@ are thin wrappers that feed the client's NDJSON iterators into that logic.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import queue
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -42,6 +44,17 @@ ACCEPT_CLAIM_TIMEOUT_S = 20.0
 # Reconnect backoff ceilings for the event and game streams.
 MAX_RECONNECT_BACKOFF_S = 60.0
 
+# Per-account singleton lock (diagnostic, requested by the opponent's
+# xmiao_glm.md §3). Two live processes for the SAME account each open an event
+# stream, Lichess pushes every gameStart to BOTH, and both connect to the same
+# game's stream -- which aborts the game at creation. A localhost TCP lock per
+# account lets us prove (and warn) when a second process for our own account is
+# already running. The port is deterministic per username so two processes for
+# the same account collide on it. SOFT: a collision is logged + flagged, never
+# blocks (a transient bind failure must not brick the GUI).
+SINGLETON_PORT_BASE = 0x6CC0  # 27840 -- registered range, low collision risk
+SINGLETON_PORT_RANGE = 0x400  # 1024 ports
+
 # Our streaming bot can't safely resume a multi-day correspondence game after a
 # restart (the event stream only delivers NEW gameStarts, not in-progress ones),
 # so auto-accept declines correspondence from configured peers. Real-time speeds
@@ -62,20 +75,26 @@ FIRST_MOVE_BUDGET_MS = 1000
 # EXPERIMENT A -- instant opening-book first move (see the
 # lichess-instant-abort-duplicate-stream memory). When we are WHITE and it is
 # move 1 from the STANDARD starting position, play a book move with NO engine
-# think so it lands at ~POST-RTT (~0.3s on our in-process controller) -- before
-# a same-owner creation abort (~0.5-1s, faster than any engine think) can land,
-# IF the abort respects "a move is on the board" (the way the no-first-move rule
-# does). This is BOTH a possible workaround AND a diagnostic:
-#   - if the game SURVIVES -> the abort was a short no-first-move window that a
-#     move-on-board blocks (ship the book move as the fix);
-#   - if it STILL ABORTS -> confirms a server-side same-owner/IP abort that
-#     ignores moves-on-board (no code fix; play third-party bots / different IPs).
-# Only move 1 / only when we are White: when we are Black the opponent (White)
-# must move first (their side). Legality is verified against the rebuilt board,
-# so a non-standard initialFen is safe and a book entry that is not a legal move
-# 1 (e.g. castling, which is impossible from the start) is silently skipped. Set
-# to () to disable (the engine then chooses move 1 as before). Extend the tuple
-# for variety (the first legal entry is played).
+# think. Originally aimed to land move 1 at ~POST-RTT (~0.3s on our in-process
+# controller) -- before a same-owner creation abort (~0.5-1s, faster than any
+# engine think) can land, IF the abort respects "a move is on the board".
+#
+# TESTED & FALSIFIED as a workaround (game CTteTHAU, 2026-06-28): the opponent
+# (xmiao_ds, White) played an instant e2e4 (0ms think) and it STILL aborted --
+# HTTP 400 "game already over"; the abort beat even the fastest possible first
+# move, so it does NOT respect an incoming move. A keep-alive POST refactor
+# (A2) was considered to cut the urllib no-keep-alive POST RTT, but rejected:
+# the opponent's keep-alive lichess-bot POST already lost the same race.
+#
+# RETAINED as a TOGGLEABLE DIAGNOSTIC / fast move-1 only, NOT a workaround.
+# Set to () to disable (the engine then chooses move 1 as before). It applies
+# only on move 1 / only when we are White (when we are Black the opponent,
+# White, must move first). No code fix on either side stops the abort; the
+# decisive test is the third-party-bot experiment (see the memory). Legality is
+# verified against the rebuilt board, so a non-standard initialFen is safe and a
+# book entry that is not a legal move 1 (e.g. castling, impossible from the
+# start) is silently skipped. Extend the tuple for variety (first legal entry
+# played).
 _OPENING_BOOK_WHITE_MOVE1: tuple[str, ...] = ("e2e4",)
 
 
@@ -100,6 +119,27 @@ class ChallengeSent:
     # silently playing a no-clock game.
     speed: str = ""
     clock: str = ""  # "limit+increment", e.g. "300+3"; "" for correspondence
+    # Whether the challenge is rated (True) or casual (False). Echoed from
+    # Lichess's challenge JSON when available, else falls back to what we
+    # requested (``self.rated``). Surfaced so the GUI can log "rated"/"casual"
+    # explicitly — the mode is relevant to the abort investigation (the opponent
+    # now declines casual) and is NOT itself an asserted fix.
+    rated: bool = False
+
+
+@dataclass(frozen=True)
+class ChallengeDeclined:
+    """Emitted when an OUTGOING challenge of ours is declined by the opponent.
+
+    Lichess delivers a ``challengeDeclined`` event on the event stream. Without
+    handling it, a decline was silently dropped and the GUI log just stopped at
+    "Challenged ..." — leaving the user unable to see *why* no game started (the
+    prior failure mode: the opponent declines casual challenges). Surfacing it
+    makes the cause visible. ``opponent`` is the account we challenged
+    (``destUser``), and ``reason`` is Lichess's decline-reason code when present.
+    """
+    opponent: str
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -170,6 +210,7 @@ class LichessController:
         rated: bool = False,
         variant: str = "standard",
         color: str = "random",
+        singleton_bind: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.client = client if client is not None else LichessClient(token)
         self.engine_choose = engine_choose
@@ -204,7 +245,18 @@ class LichessController:
         # event stream reconnecting and re-emitting ``gameStart`` for a game we
         # are already streaming (which would start a second, racing thread).
         self._streaming: set[str] = set()
+        # Per-game open-stream counter (opponent's xmiao_glm.md §1). n=1 is the
+        # normal single stream; n>1 means a DUPLICATE game-stream connection for
+        # the same game (a second event-stream connection on this account) -- the
+        # abort cause. Increment on open, decrement on close, under the lock.
+        self._stream_count: dict[str, int] = {}
         self._challenge_thread: Optional[threading.Thread] = None
+        # Per-account singleton lock callable (xmiao_glm.md §3). Returns True iff
+        # THIS process exclusively acquired the lock for the account. Default
+        # None -> use the real localhost-port bind in start(). Inject a fake in
+        # tests so they never open real sockets. SOFT: never blocks.
+        self._singleton_bind: Optional[Callable[[str], bool]] = singleton_bind
+        self._singleton_sock: Optional[socket.socket] = None
 
     # --- lifecycle ----------------------------------------------------------
 
@@ -221,12 +273,29 @@ class LichessController:
         # Detect that up front so we can block challenges and tell the user to
         # upgrade, rather than letting the first game stream fail cryptically.
         self._is_bot = (profile.get("title") == "BOT")
+        # Per-account singleton lock (xmiao_glm.md §3): prove we are the ONLY
+        # process for this account. A second process double-connects the game
+        # stream and aborts every game at creation. SOFT -- a failure is logged +
+        # flagged, never blocks. Acquired BEFORE the connect line so the line
+        # itself reports the result ("single instance" vs "DUPLICATE").
+        single = self._acquire_singleton()
         # Include the OS PID so a second `Connected as <name>` line can be told
         # apart from a reconnect: a reconnect keeps the SAME pid; a second process
         # has a different pid. This lets us prove from our own log that our side
         # did not spawn a second event-stream connection (see the instant-abort
         # analysis — two `Connected as` lines alone do NOT prove a duplicate).
-        self._push(Status(f"Connected as {self._username} (PID {os.getpid()})"))
+        if single:
+            self._push(Status(
+                f"Connected as {self._username} (PID {os.getpid()}, single instance)"))
+        else:
+            self._push(Status(
+                f"Connected as {self._username} (PID {os.getpid()}) — DUPLICATE: "
+                "another process is already running this account. Two live event "
+                "streams double-connect the game stream and abort every game; "
+                "close the other instance (check Task Manager for a 2nd process)."))
+            self._push(Error(
+                f"Duplicate {self._username} instance detected — another process "
+                "is already running this account. Close it before playing."))
         if not self._is_bot:
             self._push(Error(
                 f"@{self._username} is not a Bot account. The Lichess bot API "
@@ -262,6 +331,56 @@ class LichessController:
             self._ensure_challenge_thread()
         else:
             self._push(Error("Upgrade returned success but account is still not a Bot"))
+
+    # --- per-account singleton lock (xmiao_glm.md §3) ----------------------
+
+    @staticmethod
+    def _singleton_port_for(username: str) -> int:
+        """Deterministic localhost port for an account's singleton lock.
+
+        Same username -> same port (two processes for the same account collide,
+        so the second is detected). Different usernames -> different ports (our
+        own two bots can coexist). Uses ``hashlib.md5`` -- NOT ``hash()``, which
+        is randomized per process and would give each process a different port
+        and so defeat the lock. The port lands in the registered range.
+        """
+        digest = hashlib.md5(username.strip().lower().encode("utf-8"),
+                             usedforsecurity=False).digest()
+        return SINGLETON_PORT_BASE + (int.from_bytes(digest[:2], "big")
+                                      % SINGLETON_PORT_RANGE)
+
+    def _default_singleton_bind(self, username: str) -> bool:
+        """Bind a per-account localhost socket. Returns True iff acquired.
+
+        SO_REUSEADDR is deliberately NOT set: on Windows it permits port
+        sharing, which would let a second process bind the same port and defeat
+        the lock. A failure (port in use -> another process holds it, or a
+        transient bind error) returns False; the caller logs + flags it but
+        keeps running.
+        """
+        port = self._singleton_port_for(username or "lichess-bot")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", port))
+            sock.listen(1)
+        except OSError:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return False
+        self._singleton_sock = sock
+        return True
+
+    def _acquire_singleton(self) -> bool:
+        """Acquire the per-account singleton lock. SOFT: never raises."""
+        bind = self._singleton_bind if self._singleton_bind is not None \
+            else self._default_singleton_bind
+        try:
+            return bool(bind(self._username))
+        except Exception as exc:  # noqa: BLE001 - soft; never block on the lock
+            logger.debug("singleton bind raised: %s", exc)
+            return False
 
     @property
     def is_bot(self) -> bool:
@@ -301,6 +420,15 @@ class LichessController:
                 close()
             except Exception:  # noqa: BLE001 - best-effort; stop must not raise
                 logger.debug("close_streams failed during stop", exc_info=True)
+        # Release the per-account singleton lock so a later start() (or another
+        # process) can re-acquire it. Best-effort; stop must not raise.
+        sock = self._singleton_sock
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            self._singleton_sock = None
 
     @property
     def username(self) -> str:
@@ -343,6 +471,17 @@ class LichessController:
         self.auto_challenge = bool(enabled)
         if enabled:
             self._ensure_challenge_thread()
+
+    def set_rated(self, enabled: bool) -> None:
+        """Toggle rated vs casual mode for the NEXT challenge.
+
+        Casual (False) is the default and is a fully supported Lichess bot mode.
+        Rated is opt-in — surfaced because the opponent (xmiao_ds) now declines
+        casual, NOT because rated is a proven fix for the creation-abort (see
+        CLAUDE.md: switching is a knob + the decisive experiment, not an asserted
+        cause). This affects `_issue_challenge` via ``self.rated``.
+        """
+        self.rated = bool(enabled)
 
     def challenge(self, opponent: str) -> None:
         """Manually challenge a specific ``opponent`` (one-shot, no leader/follower)."""
@@ -532,6 +671,30 @@ class LichessController:
                                 color=str(ch.get("color", "random")),
                                 rated=bool(ch.get("rated", False)),
                             ))
+                elif typ == "challengeDeclined":
+                    # Our outgoing challenge was declined by the opponent. Surface
+                    # it (the GUI logs it) and drop the pending-outgoing tracking
+                    # so a near-simultaneous reverse challenge isn't wrongly
+                    # declined and the auto-loop can re-challenge.
+                    ch = obj.get("challenge", obj)
+                    dest = ch.get("destUser") or {}
+                    opponent = str(dest.get("name") or dest.get("id")
+                                   or self._challenge_opponent(ch))
+                    reason = str(
+                        obj.get("declineReason") or ch.get("declineReason")
+                        or "").strip()
+                    self._forget_outgoing(opponent)
+                    self._push(ChallengeDeclined(opponent=opponent, reason=reason))
+                elif typ == "challengeCanceled":
+                    # Our outgoing challenge was canceled (by us) or expired.
+                    # Surface + clear tracking so we don't treat it as pending.
+                    ch = obj.get("challenge", obj)
+                    dest = ch.get("destUser") or {}
+                    opponent = str(dest.get("name") or dest.get("id")
+                                   or self._challenge_opponent(ch))
+                    self._forget_outgoing(opponent)
+                    self._push(Status(
+                        f"Challenge to {opponent} was canceled or expired"))
                 elif typ == "gameStart":
                     game = obj.get("game", obj)
                     gid = str(game.get("id", ""))
@@ -559,15 +722,36 @@ class LichessController:
                     # 2026-06-28) found a ~2s gap between our gameStart and our
                     # game-stream open, during which Lichess aborted the game
                     # before we connected. Previously _cancel_all_pending() ran
-                    # SYNCHRONOUSLY here, BEFORE _start_game_thread() — a wasted
-                    # RTT (the just-accepted challenge 4xx's on cancel) that
-                    # delayed the time-critical stream open. Now we spawn the game
-                    # thread first so the stream opens immediately; the cancel
-                    # runs after, in parallel with the game-thread handshake, so
-                    # it no longer gates the connection. (The cancel is
-                    # housekeeping that keeps us at one game at a time; running it
-                    # after the spawn is safe — _active_games is already set under
-                    # the lock, so the auto-challenge loop won't issue another.)
+                    # SYNCHRONOUSLY here, BEFORE _start_game_thread(), a wasted RTT
+                    # that delayed the time-critical stream open. Now we spawn the
+                    # game thread first so the stream opens immediately; the
+                    # cancel runs after, in parallel with the game-thread
+                    # handshake, so it no longer gates the connection. (The cancel
+                    # is housekeeping that keeps us at one game at a time; running
+                    # it after the spawn is safe -- _active_games is already set
+                    # under the lock, so the auto-challenge loop won't issue
+                    # another.)
+                    #
+                    # CRITICAL (root cause of the instant-at-creation abort, user
+                    # report 2026-06-28): the earlier note that "the just-accepted
+                    # challenge 4xx's on cancel" was WRONG. Lichess reuses the
+                    # challenge id as the game id, so the pending-outgoing entry
+                    # for the challenge we just issued and got accepted has the
+                    # SAME id as this game. _cancel_all_pending() used to cancel
+                    # it -- POSTing /api/challenge/{id}/cancel on our own
+                    # just-accepted 0-move game, which Lichess honors as the
+                    # challenger withdrawing and ABORTS the game at creation (0
+                    # moves, <1s). The acceptor never cancels (no pending
+                    # outgoing), so only bot-vs-bot -- both sides running this code
+                    # -- aborted; a human web game between the same two accounts
+                    # on the same two machines played fine (user-verified), proving
+                    # the abort is this cancel, not a Lichess/owner/IP policy. The
+                    # reorder above alone did NOT stop the aborts (the cancel still
+                    # ran and still aborted). The actual fix is in
+                    # _cancel_safely: it now skips any challenge id that is an
+                    # active game, so _cancel_all_pending() here only cancels
+                    # OTHER pending challenges (to different peers) and never the
+                    # one that became this game.
                     self._start_game_thread(gid)
                     self._cancel_all_pending()
                 elif typ == "gameFinish":
@@ -589,67 +773,127 @@ class LichessController:
 
     def _process_game_stream(self, game_id: str, events: Iterator[dict]) -> bool:
         """Process one game stream. Returns True if the game ended (stop reconnecting)."""
+        # Log a game-stream OPEN/CLOSE pair with a per-game counter (opponent's
+        # xmiao_glm.md §1): n=1 is the normal single stream; n>1 means a
+        # DUPLICATE game-stream connection for this game (a second event-stream
+        # connection on this account double-connects the same game's stream and
+        # aborts it at creation). OPEN fires before the loop; CLOSE fires in the
+        # finally so it balances every exit path (normal end, early game-over
+        # return, or a raised exception) -- a missing CLOSE would mask a leak.
+        n_open = self._game_stream_open(game_id)
         initial_fen = STARTING_FEN
         bot_is_white = True
         opponent_name = ""
         initialized = False
         ended = False
-
-        for obj in events:
-            if self._stop.is_set():
-                break
-            try:
-                if "white" in obj and "state" in obj:
-                    # gameFull event (first message of the game stream)
-                    initial_fen = self._normalize_fen(obj.get("initialFen"))
-                    bot_is_white = self._bot_is_white(obj)
-                    opponent = obj["black"] if bot_is_white else obj["white"]
-                    opponent_name = str(opponent.get("name", "?"))
-                    state = obj["state"]
-                    initialized = True
-                    self._push(GameStarted(
-                        game_id=game_id, bot_is_white=bot_is_white,
-                        opponent_name=opponent_name, initial_fen=initial_fen,
-                        moves=self._moves_list(state),
-                        wtime=state.get("wtime"), btime=state.get("btime"),
-                    ))
-                    if self.is_game_over_status(state.get("status", "started")):
-                        # The gameFull arrived already over: an instant abort at
-                        # game creation. We never reach _maybe_move, so no
-                        # "Engine thinking..." is pushed — the GUI keys off that
-                        # absence to diagnose this case. Surface the ACTUAL status
-                        # (aborted vs noStart — different causes) plus the
-                        # gameFull's source/speed/variant/titles, and log the
-                        # full JSON so the cause is captured even in a headless
-                        # run (Lichess gives no explicit abort-by field, so the
-                        # status + context is all we have).
-                        self._log_already_over_game_full(game_id, obj, state)
-                        self._push_game_finished(game_id, initial_fen, state)
-                        ended = True
+        try:
+            for obj in events:
+                if self._stop.is_set():
+                    break
+                try:
+                    if "white" in obj and "state" in obj:
+                        # gameFull event (first message of the game stream)
+                        initial_fen = self._normalize_fen(obj.get("initialFen"))
+                        bot_is_white = self._bot_is_white(obj)
+                        opponent = obj["black"] if bot_is_white else obj["white"]
+                        opponent_name = str(opponent.get("name", "?"))
+                        state = obj["state"]
+                        initialized = True
+                        # Surface the gameFull's status on arrival (xmiao_glm.md
+                        # §2) for EVERY game: LIVE (status=started/created) is
+                        # then distinguishable from DEAD (aborted/noStart) in the
+                        # log -- a dead gameFull on arrival is the instant-
+                        # abort-at-creation signature.
+                        self._push(Status(self._format_game_full_status(obj, state)))
+                        self._push(GameStarted(
+                            game_id=game_id, bot_is_white=bot_is_white,
+                            opponent_name=opponent_name, initial_fen=initial_fen,
+                            moves=self._moves_list(state),
+                            wtime=state.get("wtime"), btime=state.get("btime"),
+                        ))
+                        if self.is_game_over_status(state.get("status", "started")):
+                            # The gameFull arrived already over: an instant abort at
+                            # game creation. We never reach _maybe_move, so no
+                            # "Engine thinking..." is pushed — the GUI keys off that
+                            # absence to diagnose this case. Surface the ACTUAL status
+                            # (aborted vs noStart — different causes) plus the
+                            # gameFull's source/speed/variant/titles, and log the
+                            # full JSON so the cause is captured even in a headless
+                            # run (Lichess gives no explicit abort-by field, so the
+                            # status + context is all we have).
+                            self._log_already_over_game_full(game_id, obj, state)
+                            self._push_game_finished(game_id, initial_fen, state)
+                            # Stop reading once the game is over: a trailing gameState
+                            # (also "aborted") would otherwise push a SECOND
+                            # GameFinished and the GUI would log the abort twice
+                            # (game ENTGYOFG, 2026-06-28).
+                            return True
+                        else:
+                            self._maybe_move(game_id, initial_fen, state, bot_is_white)
+                    elif "moves" in obj:
+                        # gameState event (move update)
+                        state = obj
+                        self._push(GameUpdated(
+                            game_id=game_id, moves=self._moves_list(state),
+                            wtime=state.get("wtime"), btime=state.get("btime"),
+                            status=str(state.get("status", "started")),
+                            winner=state.get("winner"),
+                        ))
+                        if self.is_game_over_status(state.get("status", "started")):
+                            self._push_game_finished(game_id, initial_fen, state)
+                            # Stop reading once the game is over (see gameFull branch).
+                            return True
+                        elif initialized:
+                            self._maybe_move(game_id, initial_fen, state, bot_is_white)
+                    elif obj.get("type") == "opponentGone":
+                        continue
                     else:
-                        self._maybe_move(game_id, initial_fen, state, bot_is_white)
-                elif "moves" in obj:
-                    # gameState event (move update)
-                    state = obj
-                    self._push(GameUpdated(
-                        game_id=game_id, moves=self._moves_list(state),
-                        wtime=state.get("wtime"), btime=state.get("btime"),
-                        status=str(state.get("status", "started")),
-                        winner=state.get("winner"),
-                    ))
-                    if self.is_game_over_status(state.get("status", "started")):
-                        self._push_game_finished(game_id, initial_fen, state)
-                        ended = True
-                    elif initialized:
-                        self._maybe_move(game_id, initial_fen, state, bot_is_white)
-                elif obj.get("type") == "opponentGone":
-                    continue
-                else:
-                    logger.debug("unknown game event: %s", obj.get("type"))
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("error processing game event for %s", game_id)
-                self._push(Error(f"game {game_id}: {exc}"))
-        return ended
+                        logger.debug("unknown game event: %s", obj.get("type"))
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("error processing game event for %s", game_id)
+                    self._push(Error(f"game {game_id}: {exc}"))
+            return ended
+        finally:
+            self._game_stream_close(game_id, n_open)
+
+    def _game_stream_open(self, game_id: str) -> int:
+        """Increment the per-game open-stream counter and log OPEN. Returns n."""
+        with self._state_lock:
+            n = self._stream_count.get(game_id, 0) + 1
+            self._stream_count[game_id] = n
+        self._push(Status(f"Game stream OPEN id={game_id[:8]} n={n}"))
+        if n > 1:
+            # n>1 = a second event-stream connection on this account double-
+            # connected the game stream -- the instant-at-creation abort cause.
+            self._push(Status(
+                f"DUPLICATE game stream for {game_id} (n={n})! A second "
+                "event-stream connection for this account double-connected the "
+                "game stream; Lichess aborts the game at creation."))
+        return n
+
+    def _game_stream_close(self, game_id: str, n_open: int) -> None:
+        """Decrement the per-game counter and log CLOSE (balances the OPEN)."""
+        with self._state_lock:
+            cur = self._stream_count.get(game_id, 0)
+            self._stream_count[game_id] = max(0, cur - 1)
+        self._push(Status(f"Game stream CLOSE id={game_id[:8]} n={n_open}"))
+
+    def _format_game_full_status(self, game_full: dict, state: dict) -> str:
+        """One-line gameFull status for the activity log (xmiao_glm.md §2).
+
+        ``LIVE`` for an in-progress game (status in ACTIVE_STATUSES), ``DEAD``
+        otherwise (aborted/noStart). A DEAD gameFull on arrival is the instant-
+        abort-at-creation signature; logging it for every game lets the two be
+        told apart at a glance.
+        """
+        status = str(state.get("status") or "started")
+        w = game_full.get("white") or {}
+        b = game_full.get("black") or {}
+        wname = str(w.get("name") or w.get("id") or "?")
+        bname = str(b.get("name") or b.get("id") or "?")
+        marker = "LIVE" if status in ACTIVE_STATUSES else "DEAD"
+        return (f"gameFull: status={status}, White={wname}, Black={bname} "
+                f"({marker})")
 
     # --- helpers ------------------------------------------------------------
 
@@ -756,6 +1000,21 @@ class LichessController:
         with self._state_lock:
             return any(k.lower() == key for k in self._pending_outgoing)
 
+    def _forget_outgoing(self, opponent: str) -> None:
+        """Drop any pending-outgoing entry for ``opponent`` (case-insensitive).
+
+        Called when our challenge to them is declined / canceled / expired so we
+        don't keep treating it as pending — a stale entry would wrongly decline a
+        peer's near-simultaneous reverse challenge (the double-game guard) and
+        block the auto-challenge loop from re-issuing.
+        """
+        key = (opponent or "").lower()
+        if not key:
+            return
+        with self._state_lock:
+            for k in [k for k in self._pending_outgoing if k.lower() == key]:
+                self._pending_outgoing.pop(k, None)
+
     def _auto_challenge_targets(self) -> list[str]:
         """Leader/follower: only challenge peers whose username sorts after ours.
 
@@ -769,13 +1028,38 @@ class LichessController:
     def _cancel_safely(self, challenge_id: str) -> None:
         if not challenge_id:
             return
+        with self._state_lock:
+            # A challenge that was accepted is now the LIVE, active 0-move game:
+            # Lichess reuses the challenge id as the game id, so the pending-
+            # outgoing entry whose id == an active game id IS the game we just
+            # started. Canceling it POSTs /api/challenge/{id}/cancel on our own
+            # just-accepted challenge, which Lichess honors as the challenger
+            # withdrawing from their own 0-move game -> the game is ABORTED at
+            # creation (0 moves, <1s). This was the root cause of the instant-
+            # at-creation abort (user report, 2026-06-28): on gameStart the
+            # CHALLENGER's _cancel_all_pending() fired this cancel and aborted
+            # its own just-started game; the ACCEPTOR never cancels (it has no
+            # pending outgoing), which is why only bot-vs-bot (both sides running
+            # this code) aborted while a human web game between the same two
+            # accounts on the same two machines played fine (user-verified) --
+            # the abort is this cancel call, NOT a Lichess/owner/IP policy. Skip
+            # the cancel and let the game play; the caller has already cleared
+            # the _pending_outgoing entry, so nothing lingers.
+            if challenge_id in self._active_games:
+                return
         try:
             self.client.cancel_challenge(challenge_id)
         except LichessAPIError:
             logger.debug("cancel %s failed (ignored)", challenge_id)
 
     def _cancel_all_pending(self) -> None:
-        """Cancel every tracked outgoing challenge (HTTP outside the lock)."""
+        """Cancel every tracked outgoing challenge (HTTP outside the lock).
+
+        Safe to call on gameStart: :meth:`_cancel_safely` skips any entry whose
+        id is the active game (the just-accepted challenge), so this only
+        cancels OTHER pending challenges (one-game-at-a-time housekeeping) and
+        never aborts the game that just started.
+        """
         with self._state_lock:
             items = list(self._pending_outgoing.values())
             self._pending_outgoing.clear()
@@ -799,6 +1083,7 @@ class LichessController:
         cid = ""
         speed = ""
         clock_str = ""
+        rated = self.rated
         if isinstance(result, dict):
             ch = result.get("challenge")
             ch = ch if isinstance(ch, dict) else result
@@ -807,8 +1092,12 @@ class LichessController:
             clk = ch.get("clock") or {}
             if isinstance(clk, dict) and clk.get("limit") is not None:
                 clock_str = f"{clk.get('limit')}+{clk.get('increment', 0)}"
+            # Lichess echoes the rated flag on the challenge object; trust it when
+            # present, else keep what we requested (``self.rated``).
+            if "rated" in ch:
+                rated = bool(ch.get("rated"))
         self._push(ChallengeSent(challenge_id=cid, opponent=opponent,
-                                 speed=speed, clock=clock_str))
+                                 speed=speed, clock=clock_str, rated=rated))
         # No separate "Challenged … waiting for accept" Status: ChallengeSent is
         # the structured signal, and the GUI sets the status text + logs the line
         # from it. A second Status would only duplicate the log line.
@@ -850,7 +1139,12 @@ class LichessController:
             if cid:
                 with self._state_lock:
                     if self._active_games or self._accepting_active():
-                        self._cancel_safely(cid)  # a game started mid-issue; abort
+                        # A game started while this challenge was being created.
+                        # Cancel the fresh challenge -- UNLESS it itself was just
+                        # accepted and became that active game (same id), in which
+                        # case _cancel_safely skips it so we don't abort our own
+                        # just-started game (see the gameStart note + _cancel_safely).
+                        self._cancel_safely(cid)
                     else:
                         self._pending_outgoing[opp] = cid
             return  # one peer per tick
@@ -904,10 +1198,11 @@ class LichessController:
         """Return an instant opening-book UCI move for our first move as White
         from the standard starting position, else None.
 
-        See ``_OPENING_BOOK_WHITE_MOVE1`` for the rationale (Experiment A: land
-        move 1 at ~POST-RTT, before a same-owner creation abort can land). The
-        first book entry that is legal in the rebuilt board is returned;
-        legality is checked by UCI-string membership, so a misconfigured/illegal
+        See ``_OPENING_BOOK_WHITE_MOVE1`` for the rationale and the TESTED &
+        FALSIFIED status (Experiment A: the abort beats even a 0ms-think move, so
+        this is a toggle/diagnostic, not a workaround). The first book entry that
+        is legal in the rebuilt board is returned; legality is checked by
+        UCI-string membership, so a misconfigured/illegal
         entry is silently skipped and None is returned if none match.
         """
         if not bot_is_white or moves or initial_fen != STARTING_FEN:
@@ -930,11 +1225,13 @@ class LichessController:
         if board is None:
             return
 
-        # EXPERIMENT A: instant opening-book first move as White from the
-        # standard start position (see _OPENING_BOOK_WHITE_MOVE1). Skips the
-        # engine entirely so move 1 lands at ~POST-RTT, before a same-owner
-        # creation abort (~0.5-1s, faster than any engine think) can land -- IF
-        # the abort respects moves-on-board. Falls back to the engine otherwise
+        # EXPERIMENT A (TESTED & FALSIFIED as a workaround; retained as a
+        # toggle/diagnostic -- see _OPENING_BOOK_WHITE_MOVE1): instant
+        # opening-book first move as White from the standard start position.
+        # Skips the engine entirely so move 1 lands at ~POST-RTT. NB: the
+        # opponent tested this (CTteTHAU) and the abort still beat an instant
+        # move, so this does NOT reliably prevent the abort -- it is kept only
+        # as a fast move-1 / diagnostic. Falls back to the engine otherwise
         # (and for every other move).
         book_uci = self._instant_first_move(board, initial_fen, moves, bot_is_white)
         if book_uci is not None:

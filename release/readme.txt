@@ -30,13 +30,18 @@ finished games can be reviewed move-by-step with the <<  <  >  >> buttons
 Requirements:
   - A dedicated Lichess BOT account (NOT your personal account).
   - A Lichess API token with the "bot:play" scope.
-  - The token set as the LICHESS_BOT_TOKEN environment variable before
-    launching the app, e.g. (Command Prompt):
-        set LICHESS_BOT_TOKEN=your_token_here
+  - The token, set in EITHER of these ways:
+      * Enter it in the app: open "AI vs Lichess", paste/type the token in
+        the masked input box, and click Connect (Ctrl+V pastes; Enter also
+        connects). The token is masked, never logged, and never written to
+        a file.
+      * Or set the LICHESS_BOT_TOKEN environment variable before launching,
+        e.g. (Command Prompt):
+            set LICHESS_BOT_TOKEN=your_token_here
   - An internet connection. On first run, Windows Firewall may prompt
     for network access - allow it so the bot can reach lichess.org.
 
-If no token is found, the panel shows instructions. See the developer
+If no token is found, the panel shows the token input box. See the developer
 README and lichess/README_LICHESS.md (in the source repo) for full setup.
 
 HOW TO PLAY
@@ -92,4 +97,4 @@ Delete GLM_CC_Chess.exe. No other files are created on your system.
 
 VERSION
 -------
-1.1.0
+1.2.0

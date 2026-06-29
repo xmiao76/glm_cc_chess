@@ -23,6 +23,7 @@ from src.lichess_controller import (
     LichessController,
     ChallengeReceived,
     ChallengeSent,
+    ChallengeDeclined,
     GameStarted,
     GameUpdated,
     EngineMoved,
@@ -129,7 +130,7 @@ class FakeClient:
         }
         self.created_challenges.append(record)
         resp = {"id": f"c{len(self.created_challenges)}", "direction": "out",
-                "color": color}
+                "color": color, "rated": rated}
         # Mirror Lichess's challenge JSON so the controller can surface the speed
         # it actually assigned (rapid when a clock is present, correspondence
         # when none — the symptom of clock params not reaching the body).
@@ -157,6 +158,9 @@ def fake_choose(board, time_limit_ms=None):
 
 
 def make_controller(client, **kw):
+    # Inject a no-op singleton bind so tests that exercise start() never open a
+    # real localhost socket (deterministic, no port collisions across tests).
+    kw.setdefault("singleton_bind", lambda name: True)
     ctrl = LichessController(token="x", client=client, engine_choose=fake_choose, **kw)
     ctrl._username = "MyBot"  # normally set by start() -> get_profile()
     return ctrl
@@ -296,6 +300,26 @@ class TestLichessClient:
         assert "clock%5B" not in body  # no encoded brackets
         assert "clock[" not in body    # no literal brackets
         assert urlsplit(captured["url"]).query == ""  # nothing in query string
+
+    def test_create_challenge_sends_rated_true_in_body(self):
+        # Counterpart to the rated=false body test: when rated=True the body must
+        # carry rated=true (Lichess reads it from the body, not the query string).
+        # This is the param the opponent asked us to verify.
+        from urllib.parse import urlsplit
+        captured = {}
+
+        def fake(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["data"] = req.data
+            return FakeJsonResp({"id": "abc", "direction": "out"})
+
+        c = LichessClient(token="SECRET")
+        with patch("urllib.request.urlopen", side_effect=fake):
+            c.create_challenge("BotY", rated=True, clock_limit_s=300)
+        assert urlsplit(captured["url"]).query == ""
+        body = captured["data"].decode()
+        assert "rated=true" in body
+        assert "rated=false" not in body
 
     def test_decline_challenge_sends_reason_in_body(self):
         # The decline reason must reach Lichess: it's read from the POST body,
@@ -575,6 +599,110 @@ class TestControllerTurnAndMove:
                    and "already over" in e.message][0]
         assert "status=noStart" in summary.message
 
+    def test_already_over_gamefull_then_trailing_gamestate_emits_single_finished(self):
+        # Game ENTGYOFG (2026-06-28): the game stream sent a gameFull already
+        # carrying status "aborted" FOLLOWED BY a trailing gameState that also
+        # carried status "aborted". Both the gameFull branch and the gameState
+        # branch detect game-over, so a naive loop pushes TWO GameFinished — and
+        # the GUI then logged "Game over: Game aborted" + the diagnostic TWICE.
+        # The controller must stop reading the stream once the game is over, so
+        # exactly ONE GameFinished is emitted for the game.
+        fc = FakeClient("MyBot")
+        ctrl = make_controller(fc)
+        game_full = {"id": "g", "white": {"name": "MyBot", "title": "BOT"},
+                     "black": {"name": "O", "title": "BOT"},
+                     "initialFen": "startpos", "source": "friend", "speed": "blitz",
+                     "variant": {"key": "standard", "name": "Standard"},
+                     "state": {"moves": "", "wtime": 300000, "btime": 300000,
+                               "winc": 0, "binc": 0, "status": "aborted"}}
+        trailing = {"type": "gameState", "moves": "", "wtime": 300000,
+                    "btime": 300000, "winc": 0, "binc": 0, "status": "aborted"}
+        ctrl._process_game_stream("g", iter([game_full, trailing]))
+        events = drain(ctrl)
+        finished = [e for e in events if isinstance(e, GameFinished)]
+        assert len(finished) == 1
+        assert finished[0].status == "aborted"
+
+    def test_game_stream_emits_open_and_close_with_counter(self):
+        # Opponent's xmiao_glm.md §1: log a game-stream OPEN/CLOSE pair with a
+        # per-game counter so a DUPLICATE stream connection (n>1) is visible --
+        # the single most useful diagnostic for the instant-at-creation abort.
+        # OPEN fires at the top of _process_game_stream (before GameStarted);
+        # CLOSE fires in the finally (after the last event). n=1 for a normal
+        # single stream; n>1 means a second stream for the same game.
+        fc = FakeClient("MyBot")
+        ctrl = make_controller(fc)
+        game_full = {"id": "ENTGYOFG", "white": {"name": "MyBot", "title": "BOT"},
+                     "black": {"name": "O", "title": "BOT"},
+                     "initialFen": "startpos",
+                     "state": {"moves": "", "wtime": 300000, "btime": 300000,
+                               "winc": 0, "binc": 0, "status": "started"}}
+        ctrl._process_game_stream("ENTGYOFG", iter([game_full]))
+        events = drain(ctrl)
+        statuses = [e.message for e in events if isinstance(e, Status)]
+        opens = [s for s in statuses if "Game stream OPEN" in s]
+        closes = [s for s in statuses if "Game stream CLOSE" in s]
+        assert len(opens) == 1, statuses
+        assert len(closes) == 1, statuses
+        assert "ENTGYOFG" in opens[0] and "n=1" in opens[0]
+        assert "ENTGYOFG" in closes[0] and "n=1" in closes[0]
+        # OPEN must precede GameStarted; CLOSE is the final event.
+        types = [type(e) for e in events]
+        assert types.index(Status) < types.index(GameStarted)
+        assert types[-1] is Status  # CLOSE is last
+
+    def test_game_stream_close_fires_on_already_over_early_return(self):
+        # The already-over gameFull branch returns early; the try/finally must
+        # still emit CLOSE so a stream that never reached the normal loop end is
+        # balanced (a missing CLOSE would mask a leaked stream).
+        fc = FakeClient("MyBot")
+        ctrl = make_controller(fc)
+        game_full = {"id": "g", "white": {"name": "MyBot", "title": "BOT"},
+                     "black": {"name": "O", "title": "BOT"},
+                     "initialFen": "startpos", "source": "friend", "speed": "blitz",
+                     "state": {"moves": "", "wtime": 300000, "btime": 300000,
+                               "winc": 0, "binc": 0, "status": "aborted"}}
+        ctrl._process_game_stream("g", iter([game_full]))
+        events = drain(ctrl)
+        statuses = [e.message for e in events if isinstance(e, Status)]
+        assert any("Game stream OPEN" in s and "n=1" in s for s in statuses), statuses
+        assert any("Game stream CLOSE" in s and "n=1" in s for s in statuses), statuses
+
+    def test_gamefull_status_on_arrival_live_game(self):
+        # Opponent's xmiao_glm.md §2: log the gameFull's status on arrival so a
+        # LIVE game (status=started) is distinguishable from a DEAD one
+        # (status=aborted/noStart) in the activity log.
+        fc = FakeClient("MyBot")
+        ctrl = make_controller(fc)
+        game_full = {"id": "g", "white": {"name": "xmiao_glm", "title": "BOT"},
+                     "black": {"name": "xmiao_ds", "title": "BOT"},
+                     "initialFen": "startpos",
+                     "state": {"moves": "", "wtime": 300000, "btime": 300000,
+                               "winc": 0, "binc": 0, "status": "started"}}
+        ctrl._process_game_stream("g", iter([game_full]))
+        events = drain(ctrl)
+        gf = [e.message for e in events if isinstance(e, Status)
+              and "gameFull:" in e.message]
+        assert gf, [e.message for e in events if isinstance(e, Status)]
+        assert "status=started" in gf[0]
+        assert "White=xmiao_glm" in gf[0]
+        assert "Black=xmiao_ds" in gf[0]
+
+    def test_gamefull_status_on_arrival_already_over(self):
+        fc = FakeClient("MyBot")
+        ctrl = make_controller(fc)
+        game_full = {"id": "g", "white": {"name": "MyBot", "title": "BOT"},
+                     "black": {"name": "O", "title": "BOT"},
+                     "initialFen": "startpos", "source": "friend", "speed": "blitz",
+                     "state": {"moves": "", "wtime": 300000, "btime": 300000,
+                               "winc": 0, "binc": 0, "status": "aborted"}}
+        ctrl._process_game_stream("g", iter([game_full]))
+        events = drain(ctrl)
+        gf = [e.message for e in events if isinstance(e, Status)
+              and "gameFull:" in e.message]
+        assert gf, [e.message for e in events if isinstance(e, Status)]
+        assert "status=aborted" in gf[0]
+
 
 class TestControllerTimeBudget:
     def test_correspondence_uses_default(self):
@@ -800,7 +928,7 @@ class TestControllerStatus:
 class TestControllerEventStream:
     def test_challenge_gamestart_gamefinish(self):
         fc = FakeClient("MyBot")
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         started = []
         ctrl._start_game_thread = lambda gid: started.append(gid)
         events = [
@@ -830,7 +958,7 @@ class TestControllerEventStream:
         # DO log a note (the recurring pattern points at a duplicate event-stream
         # connection on our side).
         fc = FakeClient("MyBot")
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         started = []
         ctrl._start_game_thread = lambda gid: started.append(gid)
         events = [{"type": "gameStart", "game": {"id": "gA"}},
@@ -848,7 +976,7 @@ class TestControllerEventStream:
 class TestControllerActions:
     def test_accept_decline_resign_abort_propagate(self):
         fc = FakeClient("MyBot")
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.accept_challenge("ch1")
         assert fc.last_accept == "ch1"
         ctrl.decline_challenge("ch1")
@@ -860,7 +988,7 @@ class TestControllerActions:
 
     def test_start_fetches_profile_and_emits_status(self):
         fc = FakeClient("MyBot")
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.start()
         # start() pushes the Status event synchronously before the event
         # thread begins, so no sleep is needed.
@@ -874,7 +1002,7 @@ class TestControllerActions:
             def resign(self, gid):
                 raise LichessAPIError("nope")
         fc = ErrClient("MyBot")
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.resign("gA")
         out = drain(ctrl)
         assert any(isinstance(e, Error) for e in out)
@@ -890,7 +1018,7 @@ class TestControllerBotAccount:
         # A normal account (no "BOT" title) cannot use bot-only endpoints.
         # start() must flag it, push an actionable error, and block challenges.
         fc = FakeClient("xmiao_glm", title=None)
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.start()
         assert ctrl.is_bot is False
         out = drain(ctrl)
@@ -907,7 +1035,7 @@ class TestControllerBotAccount:
 
     def test_start_detects_bot_account(self):
         fc = FakeClient("realbot", title="BOT")
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.start()
         assert ctrl.is_bot is True
         out = drain(ctrl)
@@ -917,7 +1045,8 @@ class TestControllerBotAccount:
     def test_auto_challenge_not_started_for_non_bot(self):
         fc = FakeClient("xmiao_glm", title=None)
         ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose,
-                                 opponents=("xmiao_ds",), auto_challenge=True)
+                                 opponents=("xmiao_ds",), auto_challenge=True,
+                                 singleton_bind=lambda name: True)
         ctrl.start()
         ctrl.stop()
         # No auto-challenge thread should be running for a non-bot account.
@@ -926,7 +1055,7 @@ class TestControllerBotAccount:
 
     def test_upgrade_account_promotes_to_bot(self):
         fc = FakeClient("xmiao_glm", title=None)
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.start()
         drain(ctrl)
         assert ctrl.is_bot is False
@@ -947,7 +1076,7 @@ class TestControllerBotAccount:
             def upgrade_to_bot(self):
                 raise LichessAPIError("nope", status=400)
         fc = ErrClient("xmiao_glm", title=None)
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.start()
         drain(ctrl)
         ctrl.upgrade_account()
@@ -1009,6 +1138,44 @@ class TestControllerChallenge:
         assert len(sent) == 1
         assert sent[0].speed == "correspondence"
         assert sent[0].clock == ""
+
+    def test_rated_challenge_is_sent_and_echoed_on_challenge_sent(self):
+        # The opponent (xmiao_ds) asked: "Are your challenges rated or casual?"
+        # The answer is decided by the controller's `rated` flag -> the rated
+        # param in the POST body. ChallengeSent must carry the rated flag Lichess
+        # confirmed so the GUI can log "rated"/"casual" explicitly.
+        fc = FakeClient("alpha")
+        ctrl = make_controller(fc, rated=True)
+        ctrl.challenge("BotY")
+        # The controller must pass rated=True to the client (-> POST body).
+        assert fc.created_challenges[0]["rated"] is True
+        sent = [e for e in drain(ctrl) if isinstance(e, ChallengeSent)]
+        assert len(sent) == 1
+        assert sent[0].rated is True
+
+    def test_casual_challenge_is_default_and_echoed_on_challenge_sent(self):
+        # Default (no LICHESS_RATED) is casual (rated=False) — preserves prior
+        # behavior. ChallengeSent.rated must be False so the GUI logs "casual".
+        fc = FakeClient("alpha")
+        ctrl = make_controller(fc)  # rated defaults to False
+        ctrl.challenge("BotY")
+        assert fc.created_challenges[0]["rated"] is False
+        sent = [e for e in drain(ctrl) if isinstance(e, ChallengeSent)]
+        assert len(sent) == 1
+        assert sent[0].rated is False
+
+    def test_set_rated_changes_mode_for_next_challenge(self):
+        # The GUI Rated/Casual toggle calls set_rated(); it must flip the mode the
+        # controller sends on the NEXT challenge (rated is read at issue time).
+        fc = FakeClient("alpha")
+        ctrl = make_controller(fc)  # default casual
+        assert ctrl.rated is False
+        ctrl.set_rated(True)
+        assert ctrl.rated is True
+        ctrl.challenge("BotY")
+        assert fc.created_challenges[0]["rated"] is True
+        sent = [e for e in drain(ctrl) if isinstance(e, ChallengeSent)]
+        assert sent[0].rated is True
 
     def test_reverse_challenge_declined_while_outgoing_pending(self):
         # We just challenged a peer (pending outgoing) and their near-simultaneous
@@ -1091,6 +1258,56 @@ class TestControllerChallenge:
         assert fc.last_accept is None
         assert not any(isinstance(e, ChallengeReceived) for e in drain(ctrl))
         assert ctrl._pending_outgoing.get("beta") == "chQ"
+
+    def test_outgoing_challenge_declined_surfaces_and_clears_pending(self):
+        # When the opponent declines our outgoing challenge, Lichess delivers a
+        # challengeDeclined event. We must surface it (so the GUI can log it —
+        # the prior build silently dropped it and the log just stopped at
+        # "Challenged ...") and clear the pending-outgoing tracking.
+        fc = FakeClient("alpha")
+        ctrl = make_controller(fc, opponents=("beta",), auto_accept=True)
+        ctrl._pending_outgoing["beta"] = "chX"  # we just challenged beta
+        event = {"type": "challengeDeclined", "challenge": {
+            "id": "chX", "status": "declined", "speed": "blitz",
+            "challenger": {"name": "alpha"}, "destUser": {"name": "beta"},
+            "declineReason": "casual"}}
+        ctrl._process_event_stream(iter([event]))
+        out = drain(ctrl)
+        declined = [e for e in out if isinstance(e, ChallengeDeclined)]
+        assert len(declined) == 1
+        assert declined[0].opponent == "beta"   # opponent is destUser, not us
+        assert declined[0].reason == "casual"
+        assert "beta" not in ctrl._pending_outgoing  # cleared
+
+    def test_outgoing_challenge_declined_without_reason(self):
+        # Some payloads omit the decline reason — still surface the decline.
+        fc = FakeClient("alpha")
+        ctrl = make_controller(fc, opponents=("beta",))
+        ctrl._pending_outgoing["beta"] = "chX"
+        event = {"type": "challengeDeclined", "challenge": {
+            "id": "chX", "status": "declined", "speed": "blitz",
+            "challenger": {"name": "alpha"}, "destUser": {"name": "beta"}}}
+        ctrl._process_event_stream(iter([event]))
+        out = drain(ctrl)
+        declined = [e for e in out if isinstance(e, ChallengeDeclined)]
+        assert len(declined) == 1
+        assert declined[0].opponent == "beta"
+        assert declined[0].reason == ""
+        assert "beta" not in ctrl._pending_outgoing
+
+    def test_outgoing_challenge_canceled_surfaces_and_clears_pending(self):
+        # A canceled/expired outgoing challenge must also be surfaced + cleared.
+        fc = FakeClient("alpha")
+        ctrl = make_controller(fc, opponents=("beta",))
+        ctrl._pending_outgoing["beta"] = "chX"
+        event = {"type": "challengeCanceled", "challenge": {
+            "id": "chX", "status": "canceled", "speed": "blitz",
+            "destUser": {"name": "beta"}}}
+        ctrl._process_event_stream(iter([event]))
+        out = drain(ctrl)
+        assert any(isinstance(e, Status) and "cancel" in e.message.lower()
+                   and "beta" in e.message for e in out)
+        assert "beta" not in ctrl._pending_outgoing
 
     def test_auto_accept_declines_correspondence_from_peer(self):
         # Correspondence (no clock, days/move) can't be safely resumed by our
@@ -1184,6 +1401,54 @@ class TestControllerChallenge:
         ctrl._start_game_thread = lambda gid: started.append(gid)
         ctrl._process_event_stream(iter([{"type": "gameStart", "game": {"id": "g1"}}]))
         assert "oldid" in fc.cancelled
+        assert ctrl._pending_outgoing == {}
+        assert "g1" in ctrl._active_games
+        assert started == ["g1"]
+
+    def test_gamestart_does_not_cancel_challenge_that_became_the_game(self):
+        # ROOT CAUSE of the instant-at-creation abort (user report, 2026-06-28):
+        # when our outgoing challenge is accepted, Lichess REUSES the challenge
+        # id as the game id (lichess-org/api issue #234 confirms the same id
+        # fires for challengeCanceled and a later gameStart), so gameStart
+        # arrives for that SAME id. _cancel_all_pending() then POSTed
+        # /api/challenge/{id}/cancel on the challenge that JUST became the live
+        # 0-move game -- which Lichess honors as the challenger withdrawing from
+        # their own just-accepted challenge, aborting the game at creation (0
+        # moves, <1s). The acceptor's side is clean (it never cancels -- it has
+        # no pending outgoing), so the abort comes from the CHALLENGER's side
+        # doing this cancel. A human web game between the same two accounts on
+        # the same two machines plays fine (user-verified), so the abort is this
+        # cancel call, NOT a Lichess/owner/IP policy. The fix: do NOT cancel the
+        # pending-outgoing entry whose id == the active game id; only cancel
+        # OTHER pending challenges (one-game-at-a-time housekeeping).
+        fc = FakeClient("alpha")
+        ctrl = make_controller(fc, opponents=("beta",), auto_challenge=True)
+        ctrl._username = "alpha"
+        # Our outgoing challenge to beta was accepted: its id == the game id.
+        ctrl._pending_outgoing["beta"] = "g1"
+        started = []
+        ctrl._start_game_thread = lambda gid: started.append(gid)
+        ctrl._process_event_stream(iter([{"type": "gameStart", "game": {"id": "g1"}}]))
+        assert "g1" not in fc.cancelled        # MUST NOT abort our own just-started game
+        assert ctrl._pending_outgoing == {}    # entry cleared (forgotten, not canceled)
+        assert "g1" in ctrl._active_games
+        assert started == ["g1"]               # we still connect to play the game
+
+    def test_gamestart_cancels_other_pending_but_not_the_active_game(self):
+        # Multi-peer: a game starts with beta (challenge id == game id g1) while
+        # we also hold an UNRELATED pending challenge to gamma. We must cancel
+        # gamma's (keep one game at a time -- gamma could otherwise accept and
+        # start a second game) but NOT beta's (it became the active game).
+        fc = FakeClient("alpha")
+        ctrl = make_controller(fc, opponents=("beta", "gamma"), auto_challenge=True)
+        ctrl._username = "alpha"
+        ctrl._pending_outgoing["beta"] = "g1"        # accepted -> became game g1
+        ctrl._pending_outgoing["gamma"] = "cGamma"   # unrelated, still pending
+        started = []
+        ctrl._start_game_thread = lambda gid: started.append(gid)
+        ctrl._process_event_stream(iter([{"type": "gameStart", "game": {"id": "g1"}}]))
+        assert "g1" not in fc.cancelled        # the active game is NOT canceled
+        assert "cGamma" in fc.cancelled         # the unrelated pending challenge is
         assert ctrl._pending_outgoing == {}
         assert "g1" in ctrl._active_games
         assert started == ["g1"]
@@ -1304,6 +1569,54 @@ class TestTokenLoading:
             pygame.quit()
 
 
+class TestRatedEnv:
+    """LICHESS_RATED selects rated vs casual challenges (default casual).
+
+    The opponent (xmiao_ds) asked us to confirm whether we send rated or casual.
+    Casual (rated=false) is the default to preserve prior behavior; ``LICHESS_RATED``
+    lets the user opt into rated, which is also the decisive experiment (a rated
+    own-bot game that plays would falsify the same-IP/casual candidates). NOTE:
+    whether rated *fixes* the abort is UNVERIFIED — casual is a supported bot
+    mode, so this is a configurable knob + a logged signal, not an asserted fix.
+    """
+
+    def _make_gui(self, monkeypatch):
+        monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+        monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+        # No token -> _start_lichess still parses the env vars, then returns
+        # early (controller=None), so no real controller/threads are spawned.
+        monkeypatch.delenv("LICHESS_BOT_TOKEN", raising=False)
+        import pygame
+        pygame.init()
+        try:
+            pygame.display.set_mode((640, 480))
+            import src.gui as gui
+            g = gui.ChessGUI()
+            # Default mode is "menu"; entering Lichess mode parses the LICHESS_*
+            # env vars (then bails on the missing token — no controller spawned).
+            g._start_lichess()
+            return g, pygame
+        except Exception:
+            pygame.quit()
+            raise
+
+    def test_lichess_rated_defaults_to_casual(self, monkeypatch):
+        monkeypatch.delenv("LICHESS_RATED", raising=False)
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            assert g.lichess_rated is False
+        finally:
+            pygame.quit()
+
+    def test_lichess_rated_true_when_env_set(self, monkeypatch):
+        monkeypatch.setenv("LICHESS_RATED", "1")
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            assert g.lichess_rated is True
+        finally:
+            pygame.quit()
+
+
 # ---------------------------------------------------------------------------
 # GUI wiring for challenge + auto-match (headless pygame)
 # ---------------------------------------------------------------------------
@@ -1325,6 +1638,9 @@ class _FakeLichessController:
 
     def set_auto(self, enabled):
         self.calls.append(("auto", bool(enabled)))
+
+    def set_rated(self, enabled):
+        self.calls.append(("set_rated", bool(enabled)))
 
     def upgrade_account(self):
         self.calls.append(("upgrade",))
@@ -1355,6 +1671,25 @@ class TestLichessGuiChallenge:
             g._challenge_opponent()
             assert ("opponents", ("BotY",)) in g.lichess_controller.calls
             assert ("challenge", "BotY") in g.lichess_controller.calls
+        finally:
+            pygame.quit()
+
+    def test_toggle_rated_flips_and_notifies_controller(self, monkeypatch):
+        # The GUI Rated/Casual toggle must flip the flag AND tell the controller,
+        # so the next challenge (manual or auto) sends the new mode. Default is
+        # casual (False) — preserves behavior; the user opts into rated because
+        # the opponent (xmiao_ds) declines casual, NOT because rated is a proven
+        # abort fix.
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            assert g.lichess_rated is False
+            g._toggle_lichess_rated()
+            assert g.lichess_rated is True
+            assert ("set_rated", True) in g.lichess_controller.calls
+            assert any("rated" in line.lower() for line in g.lichess_log)
+            g._toggle_lichess_rated()
+            assert g.lichess_rated is False
+            assert ("set_rated", False) in g.lichess_controller.calls
         finally:
             pygame.quit()
 
@@ -1419,6 +1754,53 @@ class TestLichessGuiChallenge:
         finally:
             pygame.quit()
 
+    def test_challenge_sent_logs_casual_mode(self, monkeypatch):
+        # The activity log must say "casual" when rated=False — directly answering
+        # the opponent's "are your challenges rated or casual?".
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_log = []
+            g._handle_lichess_event(ChallengeSent(
+                opponent="BotY", challenge_id="c1", speed="rapid",
+                clock="300+3", rated=False))
+            log = "\n".join(g.lichess_log)
+            assert "Challenged BotY" in log
+            assert "casual" in log.lower()
+            assert "rated" not in log.lower() or "casual" in log.lower()
+        finally:
+            pygame.quit()
+
+    def test_challenge_sent_logs_rated_mode(self, monkeypatch):
+        # When rated=True the log must say "rated" so the user can SEE we are
+        # sending rated challenges (the decisive-test configuration).
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_log = []
+            g._handle_lichess_event(ChallengeSent(
+                opponent="BotY", challenge_id="c1", speed="rapid",
+                clock="300+3", rated=True))
+            log = "\n".join(g.lichess_log)
+            assert "Challenged BotY" in log
+            assert "rated" in log.lower()
+        finally:
+            pygame.quit()
+
+    def test_challenge_declined_is_logged(self, monkeypatch):
+        # When the opponent declines our challenge, the activity log MUST show it
+        # (with the reason if Lichess gave one) — the prior build silently dropped
+        # the decline and the log just stopped at "Challenged ...".
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_log = []
+            g._handle_lichess_event(ChallengeDeclined(
+                opponent="BotY", reason="casual"))
+            log = "\n".join(g.lichess_log)
+            assert "BotY" in log
+            assert "declin" in log.lower()
+            assert "casual" in log.lower()
+        finally:
+            pygame.quit()
+
     def test_engine_thinking_is_logged(self, monkeypatch):
         # "Engine thinking..." must appear in the activity log so an abort that
         # arrives during our think is visibly "we were trying", not a silent
@@ -1444,11 +1826,14 @@ class TestLichessGuiChallenge:
         finally:
             pygame.quit()
 
-    def test_field_focusable_and_typeable_when_not_connected(self, monkeypatch):
-        # Regression: the opponent field used to be unfocusable until the
-        # "Connected as" status arrived. If the profile/token failed, the user
-        # could never type the opponent name. It must be editable regardless of
-        # connection state (as long as no game/challenge/review is active).
+    def test_opponent_field_not_focusable_when_not_connected(self, monkeypatch):
+        # With the in-GUI token input, the opponent field is hidden until the
+        # connection is established (you can't challenge anyone without a
+        # connection), so a click must NOT grab opponent-field focus
+        # pre-connection. The token field is the pre-connection input instead
+        # (covered by TestLichessTokenInput). This supersedes the old regression
+        # where the opponent field was the only field and had to be editable
+        # pre-connection.
         g, pygame = self._make_gui(monkeypatch)
         try:
             g.mode = "lichess"
@@ -1459,16 +1844,8 @@ class TestLichessGuiChallenge:
             g.review_mode = False
             field = g.lichess_opponent_field
             center = (field.rect.centerx, field.rect.centery)
-            # Mirror the exact run() MOUSEBUTTONDOWN branch.
-            g.handle_button_click(center)
             g._handle_lichess_field_click(center)
-            assert field.active is True
-            # Mirror the exact run() KEYDOWN branch: type the opponent name.
-            for ch in "BotX":
-                assert g.mode == "lichess" and field is not None and field.active
-                field.handle_key(pygame.event.Event(
-                    pygame.KEYDOWN, key=pygame.K_a, unicode=ch))
-            assert field.text == "BotX"
+            assert field.active is False
         finally:
             pygame.quit()
 
@@ -1661,6 +2038,7 @@ class TestLichessGuiChallenge:
             assert "Lichess-side abort" in log
             assert "THIRD-PARTY bot" in log
             assert "DIFFERENT networks" in log
+            assert "curl ifconfig.me" in log
             # Process-count guidance still present.
             assert "run only ONE bot process per account" in log
             assert "Connected as" in log
@@ -1707,15 +2085,16 @@ class TestLichessGuiChallenge:
         finally:
             pygame.quit()
 
-    def test_abort_diagnostic_white_no_thinking_names_duplicate_event_stream(self, monkeypatch):
+    def test_abort_diagnostic_white_no_thinking_names_same_ip_owner_candidates(self, monkeypatch):
         # The user's recurring abort: bot is White, 0 moves, and we NEVER started
-        # thinking — the gameFull arrived already aborted (instant abort at game
-        # creation). A DUPLICATE event-stream connection on one of the accounts is
-        # the CANDIDATE cause (unproven for single-receipt games — the opponent
-        # receiving our challenge once OR twice both abort at creation). The
-        # diagnostic must name that candidate + the honest proof/fix (the 'Connected
-        # as' line count does NOT prove a duplicate; check the bot PROCESS count on
-        # both machines; run only ONE bot instance), not the old generic hint.
+        # thinking — the gameFull arrived already aborted (a creation/early abort,
+        # NOT the ~15-30s no-first-move timeout). The duplicate-stream candidate is
+        # now WEAKENED (both sides confirmed single-instance across NSyfD5g5,
+        # CTteTHAU, ls5G7MOe, pJiIjxtm — 4 games), so the diagnostic must NOT lead
+        # with it; it must name NO proven cause, demote the duplicate candidate,
+        # lead with the live unverified server-side candidates (same-IP /
+        # same-owner), and point at the decisive checks (curl ifconfig.me +
+        # third-party bot + different public IPs) — not the old PROCESS-count hint.
         g, pygame = self._make_gui(monkeypatch)
         try:
             g.mode = "lichess"
@@ -1732,21 +2111,33 @@ class TestLichessGuiChallenge:
             assert "never started thinking" in log
             assert "already over when we connected" in log
             assert "'aborted' status" in log          # the ACTUAL status is shown
+            # Honest framing: NO proven cause; duplicate demoted to WEAKENED.
+            assert "NONE proven" in log
             assert "DUPLICATE event-stream connection" in log
-            assert "Run only ONE bot process per account" in log
-            assert "double-connects and aborts every game" in log
-            assert "two lichess-bot instances for xmiao_ds" in log
+            assert "WEAKENED" in log
+            # Leading live unverified candidates: same-IP / same-owner.
+            assert "Lichess-side abort" in log
+            assert "same public IP" in log
+            # The decisive checks (the actual next step), not the PROCESS-count hint.
+            assert "curl ifconfig.me" in log
+            assert "THIRD-PARTY bot" in log
+            assert "DIFFERENT networks" in log
+            assert "PROCESS count" not in log
             # Honest wording (game rhftKWG3): the gameStart — not the challenge —
             # is what double-connects the game stream, so this happens with SINGLE
             # challenge receipt too. But 'Connected as' line counts do NOT prove a
             # duplicate (lichess-bot logs 'Connected' on each reconnect, so two
-            # 'Connected as <opp>' lines can be ONE process); the decisive check is
-            # the process count on both machines. The old inaccurate "both
-            # accepted"/"delivered to two streams" claim is gone.
+            # 'Connected as <opp>' lines can be ONE process). The old inaccurate
+            # "both accepted"/"delivered to two streams" claim is gone.
             assert "Connected as xmiao_ds" in log
             assert "whether our one challenge was received once or twice" in log
             assert "does NOT prove a duplicate" in log
-            assert "PROCESS count" in log
+            # Hygiene still present, demoted from the lead.
+            assert "run only ONE bot process per account" in log
+            assert "double-connects and aborts every game" in log
+            # Must NOT assert instant-at-creation as proven fact (elapsed is from
+            # our connection) and must NOT misdiagnose as a mid-game player abort.
+            assert "instant abort at creation" not in log
             assert "both accepted" not in log
             assert "delivered to two" not in log
             assert "a player aborted the game mid-way" not in log
@@ -1755,8 +2146,11 @@ class TestLichessGuiChallenge:
 
     def test_abort_diagnostic_white_was_thinking_blames_opponent_abort(self, monkeypatch):
         # Bot is White, 0 moves, but we DID start thinking (the gameFull was
-        # live; the opponent aborted during our think before the move landed).
-        # Must still point at the opponent, with the "had started thinking" clause.
+        # live; the game aborted during our think before the move landed). The
+        # causes are a manual opponent abort, a duplicate-stream conflict, OR a
+        # Lichess-side same-owner/same-IP abort. The diagnostic must keep the
+        # "had started thinking" clause (so it isn't mistaken for the
+        # already-over-on-connect case) and also point at the decisive checks.
         g, pygame = self._make_gui(monkeypatch)
         try:
             g.mode = "lichess"
@@ -1773,6 +2167,10 @@ class TestLichessGuiChallenge:
             assert "had started thinking" in log
             assert "aborted before our first move landed" in log
             assert "never started thinking" not in log
+            # The live unverified server-side candidate + decisive checks too.
+            assert "Lichess-side abort" in log
+            assert "curl ifconfig.me" in log
+            assert "THIRD-PARTY bot" in log
         finally:
             pygame.quit()
 
@@ -1818,8 +2216,12 @@ class TestLichessGuiChallenge:
     def test_abort_diagnostic_nostart_names_creation_time_conflict(self, monkeypatch):
         # status "noStart" = Lichess aborted the game BEFORE it started (a
         # creation-time conflict), distinct from the ~15-30s no-first-move
-        # timeout. The diagnostic must say so explicitly and name the duplicate
-        # event-stream cause + "check both" sides — regardless of our color.
+        # timeout. The diagnostic must say so explicitly and, like the other
+        # instant-at-creation branches, name NO proven cause, demote the
+        # duplicate-stream candidate (WEAKENED — both sides single-instance in
+        # recent cycles), lead with the same-IP/same-owner server-side candidates,
+        # and point at the decisive checks (curl ifconfig.me + third-party bot +
+        # different public IPs) — regardless of our color.
         g, pygame = self._make_gui(monkeypatch)
         try:
             g.mode = "lichess"
@@ -1836,22 +2238,32 @@ class TestLichessGuiChallenge:
             assert "aborted BEFORE it started" in log
             assert "NOT a no-first-move timeout" in log
             assert "creation-time conflict" in log
+            # Honest framing: NO proven cause; duplicate demoted to WEAKENED.
+            assert "NONE proven" in log
             assert "DUPLICATE event-stream connection" in log
-            assert "double-connects and aborts every game" in log
-            assert "two lichess-bot instances for xmiao_ds" in log
+            assert "WEAKENED" in log
+            # Leading live unverified candidates + decisive checks.
+            assert "Lichess-side abort" in log
+            assert "same public IP" in log
+            assert "curl ifconfig.me" in log
+            assert "THIRD-PARTY bot" in log
+            assert "DIFFERENT networks" in log
+            assert "PROCESS count" not in log
             # Honest wording: the gameStart double-connects the game stream
             # whether the challenge was received once or twice, but 'Connected as'
             # line counts do NOT prove a duplicate (lichess-bot logs 'Connected' on
-            # reconnect); the decisive check is the process count on both machines.
+            # reconnect).
             assert "Connected as xmiao_ds" in log
             assert "whether our one challenge was received once or twice" in log
             assert "does NOT prove a duplicate" in log
-            assert "PROCESS count" in log
-            assert "both accepted" not in log
-            assert "delivered to two" not in log
+            # Hygiene still present, demoted from the lead.
+            assert "run only ONE bot process per account" in log
+            assert "double-connects and aborts every game" in log
             # Must NOT misdiagnose as the Black no-first-move timeout.
             assert "never made the first move" not in log
             assert "Lichess aborts a game automatically" not in log
+            assert "both accepted" not in log
+            assert "delivered to two" not in log
         finally:
             pygame.quit()
 
@@ -1959,8 +2371,110 @@ class TestLichessGuiChallenge:
             assert "Lichess-side abort" in log
             assert "THIRD-PARTY bot" in log
             assert "DIFFERENT networks" in log
+            assert "curl ifconfig.me" in log
             assert "run only ONE bot process per account" in log
             assert "White (xmiao_ds) never made the first move" not in log
+        finally:
+            pygame.quit()
+
+    def test_gamefinished_not_double_logged_when_already_over(self, monkeypatch):
+        # Defense-in-depth: if two GameFinished events arrive for the SAME
+        # already-over game (a controller double-push from a trailing gameState,
+        # OR a GameUpdated that finalized it followed by a GameFinished), the
+        # GUI must log "Game over: ..." and run the abort diagnostic exactly
+        # ONCE. Game ENTGYOFG (2026-06-28) showed "Game over: Game aborted" +
+        # the diagnostic TWICE in our log.
+        from src.lichess_controller import GameStarted, GameFinished
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.mode = "lichess"
+            g.lichess_game = None
+            g.pending_challenge = None
+            g.review_mode = False
+            g._handle_lichess_event(GameStarted(
+                game_id="gD", bot_is_white=False, opponent_name="xmiao_ds",
+                initial_fen=STARTING_FEN, moves=(), wtime=300000, btime=300000))
+            g._handle_lichess_event(GameFinished(
+                game_id="gD", status="aborted", winner=None,
+                moves=(), initial_fen=STARTING_FEN))
+            g._handle_lichess_event(GameFinished(
+                game_id="gD", status="aborted", winner=None,
+                moves=(), initial_fen=STARTING_FEN))
+            # Log lines are timestamp-prefixed ("HH:MM:SS Game over: ..."), so
+            # count substring occurrences, not startswith.
+            over_count = sum(1 for ln in g.lichess_log if "Game over: Game aborted" in ln)
+            diag_count = sum(1 for ln in g.lichess_log if "Aborted within" in ln
+                             or "Aborted after" in ln)
+            assert over_count == 1
+            assert diag_count == 1
+        finally:
+            pygame.quit()
+
+    def test_abort_diagnostic_emits_concise_headline_with_mode(self, monkeypatch):
+        # The detailed abort diagnostic is a wall of text unreadable in the
+        # panel (truncated to 30 chars, 6 lines). The FIRST log line must be a
+        # concise, factual headline — status, 0 moves, our color, and the
+        # rated/casual mode (the mode is the crux of the debate; game
+        # ENTGYOFG was RATED yet still aborted). The detailed cause analysis
+        # follows on subsequent lines.
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.mode = "lichess"
+            g.lichess_last_rated = True   # we sent a RATED challenge
+            g.lichess_game = {
+                "game_id": "gH", "bot_is_white": False,
+                "opponent_name": "xmiao_ds", "moves": [],
+                "started_ticks": pygame.time.get_ticks(), "over": True,
+                "status": "aborted",
+            }
+            g.lichess_log = []
+            g._log_abort_diagnostic()
+            assert g.lichess_log, "expected at least one log line"
+            headline = g.lichess_log[0]
+            assert "0 move" in headline          # factual: 0 moves played
+            assert "[rated]" in headline         # surfaces the mode (key info)
+            assert "Black" in headline           # our color
+            assert len(headline) < 115           # concise (incl. timestamp prefix)
+            # The detailed analysis still follows after the headline.
+            detail = "\n".join(g.lichess_log[1:])
+            assert "already over when we connected" in detail
+        finally:
+            pygame.quit()
+
+    def test_challenge_sent_records_rated_mode(self, monkeypatch):
+        # The rated/casual mode of our last OUTGOING challenge is remembered so
+        # the GameStarted line and the abort headline can show it. The mode is
+        # the crux of the abort investigation (game ENTGYOFG was rated yet still
+        # aborted — falsifying the "casual is auto-aborted" claim).
+        from src.lichess_controller import ChallengeSent
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.mode = "lichess"
+            g.lichess_log = []
+            g.lichess_last_rated = None
+            g._handle_lichess_event(ChallengeSent(
+                opponent="xmiao_ds", challenge_id="abc", rated=True))
+            assert g.lichess_last_rated is True
+        finally:
+            pygame.quit()
+
+    def test_game_started_line_includes_rated_mode(self, monkeypatch):
+        # The GameStarted log line shows the rated/casual mode when known, so a
+        # glance at the log confirms which mode the (possibly aborting) game was.
+        from src.lichess_controller import GameStarted
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.mode = "lichess"
+            g.lichess_game = None
+            g.pending_challenge = None
+            g.review_mode = False
+            g.lichess_last_rated = True
+            g.lichess_log = []
+            g._handle_lichess_event(GameStarted(
+                game_id="gM", bot_is_white=False, opponent_name="xmiao_ds",
+                initial_fen=STARTING_FEN, moves=(), wtime=300000, btime=300000))
+            started_line = [ln for ln in g.lichess_log if "Game started" in ln][0]
+            assert "rated" in started_line
         finally:
             pygame.quit()
 
@@ -2041,8 +2555,347 @@ class TestLichessGuiChallenge:
 
 
 # ---------------------------------------------------------------------------
-# Copy Log feature (headless pygame)
+# In-GUI Lichess token input (headless pygame)
 # ---------------------------------------------------------------------------
+# The user can paste/type the Lichess BOT token directly in the UI and click
+# Connect, instead of setting LICHESS_BOT_TOKEN in the environment beforehand.
+# On connect the GUI sets the LICHESS_BOT_TOKEN env var (so the rest of the
+# codebase, which reads the env var, sees it) and starts the controller. The
+# token is a secret: it must NEVER be written to a log, a file, or rendered
+# unmasked on screen.
+
+
+class _FakeTokenController:
+    """Stand-in for LichessController used by the token-connect tests.
+
+    Records that start() was called and captures the token kwarg, without
+    spawning any threads or opening sockets. The GUI only needs ``username``,
+    ``is_bot``, and ``start``/``stop`` to treat it as a controller.
+    """
+
+    def __init__(self, token=None, **kwargs):
+        self.kwargs = {"token": token, **kwargs}
+        self.username = "fakebot"
+        self.is_bot = True
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        pass
+
+
+class TestLichessTokenInput:
+    def _make_gui(self, monkeypatch):
+        monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+        monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+        # No token in the environment — the UI must show the token input form.
+        monkeypatch.delenv("LICHESS_BOT_TOKEN", raising=False)
+        import pygame
+        pygame.init()
+        try:
+            pygame.display.set_mode((640, 480))
+            import src.gui as gui
+            monkeypatch.setattr(gui, "LichessController", _FakeTokenController)
+            g = gui.ChessGUI()
+            # Entering Lichess mode with no token must NOT spawn a controller;
+            # it shows the token field so the user can enter it in the UI.
+            g._start_lichess()
+            assert g.lichess_token_field is not None
+            assert g.lichess_controller is None
+            return g, pygame
+        except Exception:
+            pygame.quit()
+            raise
+
+    def test_connect_sets_env_var_and_starts_controller(self, monkeypatch):
+        os = pytest.importorskip("os")
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_token_field.set("tok_abc123")
+            g._connect_with_token()
+            # The UI input sets the env var so the rest of the codebase sees it.
+            assert os.environ.get("LICHESS_BOT_TOKEN") == "tok_abc123"
+            # A controller was created from that token and started.
+            assert isinstance(g.lichess_controller, _FakeTokenController)
+            assert g.lichess_controller.started is True
+            assert g.lichess_controller.kwargs.get("token") == "tok_abc123"
+        finally:
+            os.environ.pop("LICHESS_BOT_TOKEN", None)
+            pygame.quit()
+
+    def test_connect_never_logs_or_renders_the_token(self, monkeypatch):
+        os = pytest.importorskip("os")
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_token_field.set("SECRET_token_value")
+            g._connect_with_token()
+            # The token is a secret — it must never appear in the activity log.
+            assert "SECRET_token_value" not in "\n".join(g.lichess_log)
+            # And the masked field never holds the raw text for rendering.
+            assert g.lichess_token_field.display_text() == "*" * 18
+        finally:
+            os.environ.pop("LICHESS_BOT_TOKEN", None)
+            pygame.quit()
+
+    def test_connect_with_empty_field_warns_without_connecting(self, monkeypatch):
+        os = pytest.importorskip("os")
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_token_field.set("   ")
+            g._connect_with_token()
+            assert g.lichess_controller is None            # did not connect
+            assert os.environ.get("LICHESS_BOT_TOKEN") is None  # did not set env
+            assert "token" in g.lichess_status.lower()      # warns the user
+        finally:
+            pygame.quit()
+
+    def test_paste_into_token_field_filters_to_token_chars(self, monkeypatch):
+        # Ctrl+V pastes the clipboard into the masked token field, keeping only
+        # token-legal chars so a trailing newline/space from copying does not
+        # corrupt the token sent to Lichess.
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            monkeypatch.setattr("src.gui.paste_from_clipboard",
+                                lambda: "tok_ABC123 \n")
+            g.lichess_token_field.active = True
+            handled = g._handle_lichess_keydown(_ctrl_v(pygame))
+            assert handled is True
+            assert g.lichess_token_field.value() == "tok_ABC123"
+        finally:
+            pygame.quit()
+
+    def test_token_field_focusable_when_not_connected(self, monkeypatch):
+        # Before connecting, the token input is the active form — a click in it
+        # grabs focus and typing works. The opponent field is hidden until
+        # connected, so it must not grab focus from this click either.
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            assert g.lichess_connected is False
+            tfield = g.lichess_token_field
+            center = (tfield.rect.centerx, tfield.rect.centery)
+            g._handle_lichess_field_click(center)
+            assert tfield.active is True
+            assert g.lichess_opponent_field.active is False
+            for ch in "tok_ABC123":
+                tfield.handle_key(pygame.event.Event(
+                    pygame.KEYDOWN, key=pygame.K_a, unicode=ch))
+            assert tfield.text == "tok_ABC123"
+            # Masked: the rendered text is asterisks, never the raw token.
+            assert tfield.display_text() == "*" * 10
+        finally:
+            pygame.quit()
+
+    def test_enter_in_token_field_connects(self, monkeypatch):
+        os = pytest.importorskip("os")
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g.lichess_token_field.set("tok_enter123")
+            g.lichess_token_field.active = True
+            enter = pygame.event.Event(pygame.KEYDOWN,
+                                        {"key": pygame.K_RETURN, "unicode": "\r",
+                                         "mod": 0})
+            handled = g._handle_lichess_keydown(enter)
+            assert handled is True
+            assert os.environ.get("LICHESS_BOT_TOKEN") == "tok_enter123"
+            assert isinstance(g.lichess_controller, _FakeTokenController)
+        finally:
+            os.environ.pop("LICHESS_BOT_TOKEN", None)
+            pygame.quit()
+
+    def test_connect_form_renders_without_error_when_not_connected(self, monkeypatch):
+        # The panel must render the connect form (token label, masked field,
+        # Connect button, paste hint) without error when not connected, and must
+        # register the Connect button so a click triggers _connect_with_token.
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            g._buttons = []
+            g._draw_lichess_panel()
+            assert any(b[4] == g._connect_with_token for b in g._buttons)
+        finally:
+            pygame.quit()
+
+    def test_connect_preserves_a_long_token_not_truncated(self, monkeypatch):
+        # Regression: Lichess tokens can be >= 512 chars. The lichess-org/api
+        # OpenAPI spec says "Make sure your application can handle at least 512
+        # characters". The masked token field MUST NOT truncate a long token --
+        # if it does, the controller sends a PARTIAL token, Lichess returns
+        # HTTP 401 "No such token", and every Connect shows "profile fetch
+        # failed" (the user's "Profile Fetch Error"). This pinned when the
+        # field's max_len was set below the spec minimum (128).
+        os = pytest.importorskip("os")
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            long_token = "a" * 512   # all token-legal chars, spec-min length
+            g.lichess_token_field.set(long_token)
+            g._connect_with_token()
+            sent = g.lichess_controller.kwargs.get("token")
+            # The FULL token reaches the controller -- no truncation.
+            assert sent == long_token
+            assert len(sent) == 512
+            # And the env var (the rest of the codebase reads it) is the full token.
+            assert os.environ.get("LICHESS_BOT_TOKEN") == long_token
+        finally:
+            os.environ.pop("LICHESS_BOT_TOKEN", None)
+            pygame.quit()
+
+    def test_paste_into_token_field_keeps_a_long_token(self, monkeypatch):
+        # Pasting (Ctrl+V) a long token must keep the WHOLE token, not truncate
+        # it at the old 128-char cap (a truncated token -> HTTP 401 "No such
+        # token" -> "profile fetch failed"). Users paste tokens from lichess.org.
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            long_token = "b" * 512
+            monkeypatch.setattr("src.gui.paste_from_clipboard",
+                                lambda: long_token)
+            g.lichess_token_field.active = True
+            handled = g._handle_lichess_keydown(_ctrl_v(pygame))
+            assert handled is True
+            assert g.lichess_token_field.value() == long_token
+            assert len(g.lichess_token_field.value()) == 512
+        finally:
+            pygame.quit()
+
+    def test_typing_ime_token_lands_exact_and_connects(self, monkeypatch):
+        # Regression (the user's "Profile Fetch Error" with a VALID lip_... token):
+        # on a Windows/IME setup KEYDOWN.unicode arrives EMPTY and the OS-composed
+        # character arrives separately as a TEXTINPUT event. The old field
+        # derived the char from the key name -- pygame.key.name(K_MINUS) is "-"
+        # (the unshifted symbol), which is NOT a token-legal char, so "_" was
+        # DROPPED and lip_BXsJDkm4DGXnoDrzrVEl was mangled -> Lichess HTTP 401
+        # "No such token" -> "profile fetch failed". Routing TEXTINPUT to
+        # insert_text must capture the EXACT token, and Connect must send that
+        # exact token to the controller.
+        os = pytest.importorskip("os")
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            tfield = g.lichess_token_field
+            tfield.active = True
+            token = "lip_BXsJDkm4DGXnoDrzrVEl"
+
+            def key_mod(c):
+                if c == "_":
+                    return pygame.K_MINUS, pygame.KMOD_SHIFT
+                if c.isdigit():
+                    return getattr(pygame, "K_" + c), 0
+                if c.isupper():
+                    return getattr(pygame, "K_" + c.lower()), pygame.KMOD_SHIFT
+                return getattr(pygame, "K_" + c), 0
+
+            for c in token:
+                k, m = key_mod(c)
+                # Real pygame fires KEYDOWN (empty unicode under IME) then
+                # TEXTINPUT (the OS-composed char) for each keypress.
+                g._handle_lichess_keydown(pygame.event.Event(
+                    pygame.KEYDOWN, {"key": k, "unicode": "", "mod": m}))
+                g._handle_lichess_textinput(pygame.event.Event(
+                    pygame.TEXTINPUT, {"text": c}))
+            assert tfield.value() == token
+            g._connect_with_token()
+            assert g.lichess_controller is not None
+            assert g.lichess_controller.kwargs.get("token") == token
+        finally:
+            os.environ.pop("LICHESS_BOT_TOKEN", None)
+            pygame.quit()
+
+    def test_non_ime_keydown_and_textinput_do_not_double_insert(self, monkeypatch):
+        # Non-IME: both KEYDOWN(unicode) and TEXTINPUT fire for a keypress. The
+        # field must hold each char ONCE -- KEYDOWN.unicode inserts it and the
+        # matching TEXTINPUT is skipped (the _keydown_handled_char dedup), so
+        # "bot" is not doubled to "bbboott".
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            tfield = g.lichess_token_field
+            tfield.active = True
+            for c in "bot":
+                k = getattr(pygame, "K_" + c)
+                g._handle_lichess_keydown(pygame.event.Event(
+                    pygame.KEYDOWN, {"key": k, "unicode": c, "mod": 0}))
+                g._handle_lichess_textinput(pygame.event.Event(
+                    pygame.TEXTINPUT, {"text": c}))
+            assert tfield.value() == "bot"
+        finally:
+            pygame.quit()
+
+    def test_underscore_captured_when_ime_skips_textinput_for_it(self, monkeypatch):
+        # The user's RECURRING "Profile Fetch Error" with a VALID lip_... token:
+        # their IME fires TEXTINPUT for letters/digits but NOT for the underscore
+        # (Shift+hyphen), so the TEXTINPUT-only path drops '_' and the token is
+        # mangled (lip_... -> lip... -> HTTP 401 "No such token"). The KEYDOWN
+        # fallback must capture '_' from K_MINUS+Shift even when no TEXTINPUT
+        # event fires for it.
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            tfield = g.lichess_token_field
+            tfield.active = True
+            token = "lip_BXsJDkm4DGXnoDrzrVEl"
+
+            def key_mod(c):
+                if c == "_":
+                    return pygame.K_MINUS, pygame.KMOD_SHIFT
+                if c.isdigit():
+                    return getattr(pygame, "K_" + c), 0
+                if c.isupper():
+                    return getattr(pygame, "K_" + c.lower()), pygame.KMOD_SHIFT
+                return getattr(pygame, "K_" + c), 0
+
+            for c in token:
+                k, m = key_mod(c)
+                g._handle_lichess_keydown(pygame.event.Event(
+                    pygame.KEYDOWN, {"key": k, "unicode": "", "mod": m}))
+                if c == "_":
+                    # This IME does NOT deliver a TEXTINPUT for the underscore.
+                    continue
+                g._handle_lichess_textinput(pygame.event.Event(
+                    pygame.TEXTINPUT, {"text": c}))
+            assert tfield.value() == token   # underscore preserved, not dropped
+        finally:
+            pygame.quit()
+
+    def test_typing_token_survives_when_ime_skips_all_textinput(self, monkeypatch):
+        # PROVEN root cause of the recurring "Profile Fetch Error": the field had
+        # a KEYDOWN fallback for '_' and digits but NOT for letters, so an IME
+        # that skips TEXTINPUT (for uppercase letters, or for every key) DROPPED
+        # every letter -> lip_BXsJDkm4DGXnoDrzrVEl was mangled (repro showed
+        # 'lip_skm4norzrl' under the no-TEXTINPUT-for-shifted model, and '_4'
+        # under the no-TEXTINPUT-at-all model) -> HTTP 401 "No such token". The
+        # fallback must capture LETTERS from the key too. This is the harshest
+        # model: NO TEXTINPUT event for ANY character (pure KEYDOWN, empty
+        # unicode) -- if letters survive this, they survive every IME model.
+        g, pygame = self._make_gui(monkeypatch)
+        try:
+            tfield = g.lichess_token_field
+            tfield.active = True
+            token = "lip_BXsJDkm4DGXnoDrzrVEl"
+
+            def key_mod(c):
+                if c == "_":
+                    return pygame.K_MINUS, pygame.KMOD_SHIFT
+                if c.isdigit():
+                    return getattr(pygame, "K_" + c), 0
+                if c.isupper():
+                    return getattr(pygame, "K_" + c.lower()), pygame.KMOD_SHIFT
+                return getattr(pygame, "K_" + c), 0
+
+            for c in token:
+                k, m = key_mod(c)
+                g._handle_lichess_keydown(pygame.event.Event(
+                    pygame.KEYDOWN, {"key": k, "unicode": "", "mod": m}))
+                # NO TEXTINPUT for any char -- the IME-skips-everything case.
+            assert tfield.value() == token   # every letter captured via fallback
+        finally:
+            pygame.quit()
+
+
+# Construct a pygame KEYDOWN event for Ctrl+V (paste). pygame.event.Event is
+# available once pygame is initialized; tests call this inside _make_gui's
+# active pygame session.
+def _ctrl_v(pygame):
+    return pygame.event.Event(pygame.KEYDOWN,
+                              {"key": pygame.K_v,
+                               "unicode": "v",
+                               "mod": pygame.KMOD_CTRL})
 
 
 class TestLichessCopyLog:
@@ -2192,16 +3045,139 @@ class TestTextInput:
         finally:
             pygame.quit()
 
-    def test_typing_works_when_unicode_empty(self, monkeypatch):
-        # Regression: some Windows/IME setups deliver KEYDOWN with an empty
-        # ``unicode``. The field must still accept the character via the
-        # key-name fallback, otherwise typing would silently do nothing.
+    def test_empty_unicode_keydown_inserts_letter_via_fallback(self, monkeypatch):
+        # Regression (revised for the letter fallback): some Windows/IME setups
+        # deliver KEYDOWN with an empty ``unicode``. KEYDOWN is CONSUMED (returns
+        # True, so it does not leak to a global shortcut) and -- because some IMEs
+        # never deliver a TEXTINPUT for the key -- the fallback now inserts the
+        # char itself (K_b -> "b") and sets the dedup flag so the GUI's TEXTINPUT
+        # handler skips the matching event. This is the fix for the recurring
+        # "Profile Fetch Error": an IME that skips TEXTINPUT for letters used to
+        # leave every letter dropped -> mangled token (lip_BXs... -> "_4") ->
+        # Lichess HTTP 401 "No such token" -> "profile fetch failed".
         ti, pygame = self._make(monkeypatch)
         try:
             ti.active = True
             ev = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_b, unicode="")
-            ti.handle_key(ev)
+            assert ti.handle_key(ev) is True           # consumed, no global leak
+            assert ti.text == "b"                       # letter inserted by fallback
+            assert ti._keydown_handled_char is True     # GUI TEXTINPUT handler skips
+        finally:
+            pygame.quit()
+
+    def test_populated_unicode_keydown_inserts_and_sets_handled_flag(self, monkeypatch):
+        # Non-IME path: KEYDOWN.unicode inserts the char and marks it handled so
+        # the GUI's TEXTINPUT handler skips the matching event (no double-insert
+        # of the same keypress).
+        ti, pygame = self._make(monkeypatch)
+        try:
+            ti.active = True
+            ev = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_b, unicode="b")
+            assert ti.handle_key(ev) is True
             assert ti.text == "b"
+            assert ti._keydown_handled_char is True
+        finally:
+            pygame.quit()
+
+    def test_fallback_captures_underscore_without_textinput(self, monkeypatch):
+        # The user's IME skips TEXTINPUT for the underscore (Shift+hyphen). The
+        # KEYDOWN fallback must still capture '_' from K_MINUS + Shift + empty
+        # unicode, so lip_... tokens are not mangled to lip... (-> HTTP 401).
+        ti, pygame = self._make(monkeypatch)
+        try:
+            ti.active = True
+            ev = pygame.event.Event(pygame.KEYDOWN,
+                                     {"key": pygame.K_MINUS, "unicode": "",
+                                      "mod": pygame.KMOD_SHIFT})
+            assert ti.handle_key(ev) is True
+            assert ti.text == "_"
+            assert ti._keydown_handled_char is True   # a later TEXTINPUT must skip
+        finally:
+            pygame.quit()
+
+    def test_fallback_captures_digit_without_textinput(self, monkeypatch):
+        # Digit fallback: K_5 + empty unicode (no Shift) -> "5" even with no
+        # TEXTINPUT event. Digits are never IME-composed, so this is safe.
+        ti, pygame = self._make(monkeypatch)
+        try:
+            ti.active = True
+            ev = pygame.event.Event(pygame.KEYDOWN,
+                                     {"key": pygame.K_5, "unicode": "", "mod": 0})
+            assert ti.handle_key(ev) is True
+            assert ti.text == "5"
+        finally:
+            pygame.quit()
+
+    def test_fallback_captures_lowercase_letter_without_textinput(self, monkeypatch):
+        # A letter with empty unicode (IME skips TEXTINPUT for it) must still be
+        # captured from the key, else every letter in a token is dropped
+        # (lip_BXs... -> "_4" -> HTTP 401 "No such token"). K_b + no Shift -> "b".
+        ti, pygame = self._make(monkeypatch)
+        try:
+            ti.active = True
+            ev = pygame.event.Event(pygame.KEYDOWN,
+                                     {"key": pygame.K_b, "unicode": "", "mod": 0})
+            assert ti.handle_key(ev) is True
+            assert ti.text == "b"
+            assert ti._keydown_handled_char is True   # a later TEXTINPUT must skip
+        finally:
+            pygame.quit()
+
+    def test_fallback_captures_uppercase_letter_without_textinput(self, monkeypatch):
+        # Shift+letter with empty unicode -> the UPPERCASE letter. This is the
+        # user's actual recurring bug: their IME fires TEXTINPUT for unshifted
+        # keys but NOT for Shift+letter, so every uppercase letter in
+        # lip_BXsJDkm4DGXnoDrzrVEl (10 of them) was dropped -> mangled token
+        # (lip_skm4norzrl) -> HTTP 401 -> "profile fetch failed".
+        ti, pygame = self._make(monkeypatch)
+        try:
+            ti.active = True
+            ev = pygame.event.Event(pygame.KEYDOWN,
+                                     {"key": pygame.K_b, "unicode": "",
+                                      "mod": pygame.KMOD_SHIFT})
+            assert ti.handle_key(ev) is True
+            assert ti.text == "B"
+            assert ti._keydown_handled_char is True
+        finally:
+            pygame.quit()
+
+    def test_fallback_letter_capslock_uppercases(self, monkeypatch):
+        # CapsLock uppercases a letter just like Shift (XOR semantics).
+        ti, pygame = self._make(monkeypatch)
+        try:
+            ti.active = True
+            ev = pygame.event.Event(pygame.KEYDOWN,
+                                     {"key": pygame.K_b, "unicode": "",
+                                      "mod": pygame.KMOD_CAPS})
+            assert ti.handle_key(ev) is True
+            assert ti.text == "B"
+        finally:
+            pygame.quit()
+
+    def test_fallback_letter_shift_xor_caps_is_lowercase(self, monkeypatch):
+        # Shift + CapsLock cancel (XOR) -> lowercase, matching a real keyboard.
+        ti, pygame = self._make(monkeypatch)
+        try:
+            ti.active = True
+            ev = pygame.event.Event(pygame.KEYDOWN,
+                                     {"key": pygame.K_b, "unicode": "",
+                                      "mod": pygame.KMOD_SHIFT | pygame.KMOD_CAPS})
+            assert ti.handle_key(ev) is True
+            assert ti.text == "b"
+        finally:
+            pygame.quit()
+
+    def test_populated_but_invalid_unicode_does_not_fallback(self, monkeypatch):
+        # A populated-but-invalid unicode (e.g. "!") must be REJECTED, not
+        # substituted by a key-based fallback (K_1 -> "1"). Otherwise pressing
+        # '!' on the 1 key would insert '1'.
+        ti, pygame = self._make(monkeypatch)
+        try:
+            ti.active = True
+            ev = pygame.event.Event(pygame.KEYDOWN,
+                                     {"key": pygame.K_1, "unicode": "!", "mod": 0})
+            assert ti.handle_key(ev) is True
+            assert ti.text == ""   # '!' rejected; NOT turned into '1'
         finally:
             pygame.quit()
 
@@ -2259,6 +3235,52 @@ class TestTextInput:
             ti.draw(screen)
             ti.active = True
             ti.draw(screen)
+        finally:
+            pygame.quit()
+
+    def test_masked_display_text_is_stars(self, monkeypatch):
+        # A masked field (for the secret Lichess token) shows one '*' per char
+        # so the token is never visible on screen / in a screen recording. The
+        # real text is still stored plainly for submission; only the display is
+        # masked. '*' (not '•') because the bundled default font lacks U+2022.
+        _, pygame = self._make(monkeypatch)
+        try:
+            from src.gui_textinput import TextInput
+            font = pygame.font.Font(None, 22)
+            masked = TextInput(font, (10, 10, 100, 24), mask=True)
+            masked.set("abcd")
+            assert masked.display_text() == "*" * 4
+            # A plain (unmasked) field shows the real text.
+            plain = TextInput(font, (10, 10, 100, 24))
+            plain.set("abcd")
+            assert plain.display_text() == "abcd"
+        finally:
+            pygame.quit()
+
+    def test_insert_text_filters_by_valid_chars(self, monkeypatch):
+        # Paste (Ctrl+V) inserts clipboard text, filtered to the field's
+        # valid_chars — so pasting a token with stray whitespace/punctuation
+        # into the token field keeps only the token chars.
+        _, pygame = self._make(monkeypatch)
+        try:
+            from src.gui_textinput import TextInput
+            font = pygame.font.Font(None, 22)
+            ti = TextInput(font, (10, 10, 100, 24),
+                           valid_chars=set("ab12"), max_len=20)
+            ti.insert_text("a1! 2b")  # '!' and ' ' are not valid -> dropped
+            assert ti.text == "a12b"
+        finally:
+            pygame.quit()
+
+    def test_insert_text_respects_max_len(self, monkeypatch):
+        _, pygame = self._make(monkeypatch)
+        try:
+            from src.gui_textinput import TextInput
+            font = pygame.font.Font(None, 22)
+            ti = TextInput(font, (10, 10, 100, 24),
+                           valid_chars=set("abc"), max_len=3)
+            ti.insert_text("abcdef")
+            assert ti.text == "abc"  # truncated to max_len
         finally:
             pygame.quit()
 
@@ -2346,7 +3368,7 @@ class TestClientCloseStreams:
 class TestEventStreamLifecycle:
     def test_start_connect_status_includes_pid(self):
         fc = FakeClient("xmiao_glm", title="BOT")
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.start()
         out = drain(ctrl)
         # The connect line carries the OS PID so a second `Connected as <name>`
@@ -2359,6 +3381,52 @@ class TestEventStreamLifecycle:
                    and str(os.getpid()) in e.message for e in out)
         ctrl.stop()
 
+    def test_start_singleton_success_logs_single_instance(self):
+        # Opponent's xmiao_glm.md §3: prove our side runs a SINGLE process for
+        # this account. start() acquires a per-account localhost lock; on
+        # success the connect line says "single instance". The bind is injected
+        # so this test never opens a real socket.
+        fc = FakeClient("xmiao_glm", title="BOT")
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
+        ctrl.start()
+        out = drain(ctrl)
+        connect = [e for e in out if isinstance(e, Status)
+                   and "Connected as xmiao_glm" in e.message]
+        assert connect, out
+        assert "single instance" in connect[0].message
+        assert str(os.getpid()) in connect[0].message
+        assert not any(isinstance(e, Error) and "Duplicate" in e.message
+                       for e in out)
+        ctrl.stop()
+
+    def test_start_singleton_duplicate_warns_and_errors(self):
+        # SOFT singleton: a second process for the same account is logged loudly
+        # and an Error is pushed, but we keep running (non-trapping) so a
+        # transient bind collision doesn't brick the GUI.
+        fc = FakeClient("xmiao_glm", title="BOT")
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose,
+                                 singleton_bind=lambda name: False)
+        ctrl.start()
+        out = drain(ctrl)
+        connect = [e for e in out if isinstance(e, Status)
+                   and "Connected as xmiao_glm" in e.message]
+        assert connect, out
+        assert "DUPLICATE" in connect[0].message
+        assert any(isinstance(e, Error) and "Duplicate" in e.message for e in out)
+        ctrl.stop()
+
+    def test_singleton_port_is_deterministic_per_account(self):
+        # Same account -> same port (so a second process collides and is
+        # detected); different accounts -> different ports (so two of OUR own
+        # bots can coexist). Deterministic via hashlib.md5 (NOT hash(), which is
+        # randomized per process and would defeat the lock).
+        p1 = LichessController._singleton_port_for("xmiao_glm")
+        p2 = LichessController._singleton_port_for("xmiao_glm")
+        p3 = LichessController._singleton_port_for("xmiao_ds")
+        assert p1 == p2
+        assert p1 != p3
+        assert 1024 <= p1 <= 65535  # registered port range
+
     def test_event_thread_logs_reconnect(self, monkeypatch):
         # Near-zero backoff so the reconnect line lands quickly. The event
         # stream is an empty iterator, which the event thread treats as a
@@ -2368,7 +3436,7 @@ class TestEventStreamLifecycle:
         monkeypatch.setattr(LichessController, "_next_backoff",
                             staticmethod(lambda prev, ran: 0.02))
         fc = FakeClient("xmiao_glm", title="BOT")
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.start()
         try:
             deadline = time.monotonic() + 2.0
@@ -2394,14 +3462,14 @@ class TestEventStreamLifecycle:
             def close_streams(self):
                 self.close_calls += 1
         fc = TrackClient()
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.stop()
         assert fc.close_calls == 1
 
     def test_stop_tolerates_client_without_close_streams(self):
         # FakeClient has no close_streams; stop() must not raise (guarded).
         fc = FakeClient("xmiao_glm", title="BOT")
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl.stop()  # no exception
 
     def test_gamestart_opens_game_stream_before_cancel_http(self):
@@ -2438,7 +3506,7 @@ class TestEventStreamLifecycle:
                 return iter([])
 
         fc = Client()
-        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose)
+        ctrl = LichessController(token="x", client=fc, engine_choose=fake_choose, singleton_bind=lambda name: True)
         ctrl._pending_outgoing["beta"] = "c1"  # the just-accepted challenge
         ctrl.start()
         try:
@@ -2449,3 +3517,39 @@ class TestEventStreamLifecycle:
         finally:
             cancel_gate.set()  # release the blocked cancel_challenge
             ctrl.stop()
+
+
+class TestTokenFingerprint:
+    """The activity-log token fingerprint describes the token's SHAPE (so a
+    mangled capture is diagnosable from a copied log) without ever leaking the
+    secret."""
+
+    def _fp(self, monkeypatch, token):
+        monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+        monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+        import pygame
+        pygame.init()
+        try:
+            from src.gui import _token_fingerprint
+            return _token_fingerprint(token)
+        finally:
+            pygame.quit()
+
+    def test_describes_shape_of_real_token(self, monkeypatch):
+        fp = self._fp(monkeypatch, "lip_BXsJDkm4DGXnoDrzrVEl")
+        assert fp == "len=24 upper=10 lower=12 digit=1 under=1 other=0 prefix_lip=True"
+
+    def test_never_contains_the_secret(self, monkeypatch):
+        token = "lip_BXsJDkm4DGXnoDrzrVEl"
+        fp = self._fp(monkeypatch, token)
+        assert token not in fp
+        assert "BXsJDkm4" not in fp  # no run of the actual token text leaks
+
+    def test_flags_a_mangled_capture(self, monkeypatch):
+        # The user's failure mode: capitals dropped -> lip_BXsJDkm4DGXnoDrzrVEl
+        # became lip_skm4norzrl. The fingerprint makes that visible (len 14,
+        # upper=0) without revealing either string.
+        fp = self._fp(monkeypatch, "lip_skm4norzrl")
+        assert "len=14" in fp
+        assert "upper=0" in fp
+        assert "prefix_lip=True" in fp

@@ -20,6 +20,63 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def paste_from_clipboard() -> str | None:
+    """Read text from the system clipboard. Returns the text, or ``None``.
+
+    The inverse of :func:`copy_to_clipboard`: used by the in-GUI Lichess token
+    field's Ctrl+V paste. Backends are tried in the same order (pygame scrap
+    first since it already owns the display, then tkinter). The raw clipboard
+    text is returned unfiltered — the caller (the token field's
+    ``insert_text``) strips characters that are not valid for a Lichess token,
+    so a trailing newline or space from copying does not corrupt the token.
+    """
+    text = _paste_via_pygame_scrap()
+    if text is not None:
+        return text
+    return _paste_via_tkinter()
+
+
+def _paste_via_pygame_scrap() -> str | None:
+    """Read the clipboard via pygame's scrap module, or ``None`` if unavailable."""
+    try:
+        import pygame
+
+        if not pygame.display.get_init():
+            return None
+        scrap = getattr(pygame, "scrap", None)
+        if scrap is None:
+            return None
+        try:
+            scrap.init()
+        except Exception:  # noqa: BLE001 - scrap optional; fall through
+            return None
+        got = scrap.get(pygame.SCRAP_TEXT)
+        if isinstance(got, bytes):
+            got = got.decode("utf-8", "ignore")
+        # scrap may append a NUL terminator; drop it so it isn't pasted.
+        if got:
+            got = got.rstrip("\x00")
+        return got or None
+    except Exception:  # noqa: BLE001 - clipboard is best-effort
+        return None
+
+
+def _paste_via_tkinter() -> str | None:
+    """Read the clipboard via the stdlib Tk clipboard, or ``None``."""
+    try:
+        import tkinter
+
+        root = tkinter.Tk()
+        root.withdraw()
+        try:
+            text = root.clipboard_get()
+        finally:
+            root.destroy()
+        return text or None
+    except Exception:  # noqa: BLE001 - Tk may be absent / clipboard empty
+        return None
+
+
 def _via_pygame_scrap(text: str) -> bool:
     """Copy via pygame's scrap module, verifying the round-trip.
 

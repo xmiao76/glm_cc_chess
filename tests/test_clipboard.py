@@ -41,3 +41,36 @@ def test_pygame_scrap_returns_false_without_display(monkeypatch):
 
     monkeypatch.setattr(pygame.display, "get_init", lambda: False)
     assert cb._via_pygame_scrap("hello") is False
+
+
+def test_paste_prefers_pygame_scrap(monkeypatch):
+    calls = []
+
+    def fake_scrap():
+        calls.append("scrap")
+        return "tok_from_scrap"
+
+    monkeypatch.setattr(cb, "_paste_via_pygame_scrap", fake_scrap)
+    monkeypatch.setattr(cb, "_paste_via_tkinter", lambda: calls.append("tk") or "tok_from_tk")
+    assert cb.paste_from_clipboard() == "tok_from_scrap"
+    assert calls == ["scrap"]  # tkinter never reached
+
+
+def test_paste_falls_back_to_tkinter(monkeypatch):
+    monkeypatch.setattr(cb, "_paste_via_pygame_scrap", lambda: None)
+    assert cb._paste_via_tkinter is not None  # sanity
+    monkeypatch.setattr(cb, "_paste_via_tkinter", lambda: "tok_from_tk")
+    assert cb.paste_from_clipboard() == "tok_from_tk"
+
+
+def test_paste_returns_none_when_all_backends_fail(monkeypatch):
+    monkeypatch.setattr(cb, "_paste_via_pygame_scrap", lambda: None)
+    monkeypatch.setattr(cb, "_paste_via_tkinter", lambda: None)
+    assert cb.paste_from_clipboard() is None
+
+
+def test_paste_pygame_scrap_returns_none_without_display(monkeypatch):
+    import pygame
+
+    monkeypatch.setattr(pygame.display, "get_init", lambda: False)
+    assert cb._paste_via_pygame_scrap() is None
